@@ -1,0 +1,6 @@
+litellm
+fastapi
+uvicorn
+python-dotenv
+requests
+colorama

@@ -1,0 +1,8 @@
+{
+    "workspace": "D:\\Downloads\\Agent_Playground\\Plot using Agent",
+    "messages": [
+        {
+            "role": "user",
+            "content": "1. create a venv"
+        },
+        

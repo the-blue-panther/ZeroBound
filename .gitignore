@@ -1,0 +1,27 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE Sessions & Profiles (CRITICAL: Private login data)
+llm-web-router/profiles/
+Profiles/
+profiles/
+
+# Environment / Secret Files
+.env
+
+# Logs and OS files
+*.log
+.DS_Store
+thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
