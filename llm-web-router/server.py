@@ -181,51 +181,50 @@ async def get_response(page, cfg, prompt: str, image_urls=None):
     print("⏳ Monitoring generation state...")
     
     # 1. Wait for "Typing" to start (max 20s)
-    # Indicator: Attachment button becomes disabled
-    if "attachment_selector" in cfg:
-        started = False
-        for _ in range(40): # 20 seconds start window
-            is_disabled = await page.locator(cfg["attachment_selector"]).evaluate("(el) => el.classList.contains('ds-icon-button--disabled')")
-            if is_disabled:
-                started = True
-                print("▶ Generation started.")
-                break
-            await asyncio.sleep(0.5)
-        
-        if started:
-            # 2. Wait for "Typing" to finish
-            print("⏳ Monitoring content for completion tags (</ACTION> or </REPORT>)...")
-            for _ in range(720): # Up to 6 minutes for massive files
-                try:
-                    current_text = await page.locator(cfg["response_container"]).last.inner_text()
-                    
-                    # STRICT TAG CHECK: Check for open but unclosed structural tags
-                    # If we see <ACTION> but no </ACTION>, or <THINK> but no </THINK>, we MUST NOT break.
-                    has_open_think = "<THINK>" in current_text and "</THINK>" not in current_text
-                    has_open_action = "<ACTION>" in current_text and "</ACTION>" not in current_text
-                    has_open_report = "<REPORT>" in current_text and "</REPORT>" not in current_text
-                    
-                    is_complete_tag = "</ACTION>" in current_text or "</REPORT>" in current_text
-                    
-                    is_disabled = await page.locator(cfg["attachment_selector"]).evaluate("(el) => el.classList.contains('ds-icon-button--disabled')")
-
-                    if is_complete_tag:
-                        print("🎯 Detected completion tag. Generation confirmed complete.")
-                        break
-                    
-                    # If UI says it's done but tags are unclosed, we keep waiting (resilience to flicker)
-                    if not is_disabled:
-                        if has_open_think or has_open_action or has_open_report:
-                            print("🔍 UI says done, but tags are unclosed. Waiting for model to finish transition...")
-                        else:
-                            print("✅ UI signal: Generation finished and tags balanced.")
-                            break
-                except Exception as e:
-                    print(f"⚠️ Monitoring error: {e}")
+    # Indicator: Stop button becomes visible
+    started = False
+    for _ in range(40): 
+        is_generating = await page.locator(cfg["stop_selector"]).count() > 0
+        if is_generating:
+            started = True
+            print("▶ Generation started (Stop button detected).")
+            break
+        await asyncio.sleep(0.5)
+    
+    if started:
+        # 2. Wait for "Typing" to finish
+        print("⏳ Monitoring content for completion tags (</ACTION> or </REPORT>)...")
+        stable_since = 0
+        for _ in range(1200): # Up to 10 minutes for massive files
+            try:
+                current_text = await page.locator(cfg["response_container"]).last.inner_text()
                 
-                await asyncio.sleep(0.5)
-        else:
-            print("⚠️ Generation start signal not detected. Falling back to timer...")
+                is_complete_tag = "</ACTION>" in current_text or "</REPORT>" in current_text
+                is_generating = await page.locator(cfg["stop_selector"]).count() > 0
+                
+                if is_complete_tag:
+                    print("🎯 Detected completion tag. Generation confirmed complete.")
+                    break
+                
+                # If the Stop button is gone, we enter a "MANDATORY Stability Check"
+                # to survive the pause between Reasoning and Action.
+                if not is_generating:
+                    stable_since += 1
+                    if stable_since >= 8: # 4.0 seconds of absolute silence needed if no tag present
+                        print("✅ UI signal stable for 4.0s. Assuming completion.")
+                        break
+                    else:
+                        if stable_since == 1:
+                            print("🔍 Stop button disappeared. Verifying stability (4.0s buffer)...")
+                else:
+                    stable_since = 0 # Reset stability if it starts typing again
+                    
+            except Exception as e:
+                print(f"⚠️ Monitoring error: {e}")
+            
+            await asyncio.sleep(0.5)
+    else:
+        print("⚠️ Generation start signal (Stop button) not detected. Falling back to timer...")
     
     # --- PHASE 3: Stability Buffer ---
     print("⏳ Finalizing content...")
