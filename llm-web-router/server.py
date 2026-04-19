@@ -180,11 +180,11 @@ async def get_response(page, cfg, prompt: str, image_urls=None):
     # --- PHASE 2: Wait for Generation to START and FINISH ---
     print("⏳ Monitoring generation state...")
     
-    # 1. Wait for "Typing" to start (max 5s)
+    # 1. Wait for "Typing" to start (max 20s)
     # Indicator: Attachment button becomes disabled
     if "attachment_selector" in cfg:
         started = False
-        for _ in range(10): 
+        for _ in range(40): # 20 seconds start window
             is_disabled = await page.locator(cfg["attachment_selector"]).evaluate("(el) => el.classList.contains('ds-icon-button--disabled')")
             if is_disabled:
                 started = True
@@ -193,23 +193,36 @@ async def get_response(page, cfg, prompt: str, image_urls=None):
             await asyncio.sleep(0.5)
         
         if started:
-            # 2. Wait for "Typing" to finish (max 180s for huge files)
+            # 2. Wait for "Typing" to finish
             print("⏳ Monitoring content for completion tags (</ACTION> or </REPORT>)...")
-            for _ in range(360):
-                is_disabled = await page.locator(cfg["attachment_selector"]).evaluate("(el) => el.classList.contains('ds-icon-button--disabled')")
-                
-                # Check for explicit termination tokens in the text
+            for _ in range(720): # Up to 6 minutes for massive files
                 try:
                     current_text = await page.locator(cfg["response_container"]).last.inner_text()
-                    if "</ACTION>" in current_text or "</REPORT>" in current_text:
-                        print("🎯 Detected completion tag. Generation looks complete.")
-                        break
-                except:
-                    pass
+                    
+                    # STRICT TAG CHECK: Check for open but unclosed structural tags
+                    # If we see <ACTION> but no </ACTION>, or <THINK> but no </THINK>, we MUST NOT break.
+                    has_open_think = "<THINK>" in current_text and "</THINK>" not in current_text
+                    has_open_action = "<ACTION>" in current_text and "</ACTION>" not in current_text
+                    has_open_report = "<REPORT>" in current_text and "</REPORT>" not in current_text
+                    
+                    is_complete_tag = "</ACTION>" in current_text or "</REPORT>" in current_text
+                    
+                    is_disabled = await page.locator(cfg["attachment_selector"]).evaluate("(el) => el.classList.contains('ds-icon-button--disabled')")
 
-                if not is_disabled:
-                    print("✅ UI signal: Generation finished.")
-                    break
+                    if is_complete_tag:
+                        print("🎯 Detected completion tag. Generation confirmed complete.")
+                        break
+                    
+                    # If UI says it's done but tags are unclosed, we keep waiting (resilience to flicker)
+                    if not is_disabled:
+                        if has_open_think or has_open_action or has_open_report:
+                            print("🔍 UI says done, but tags are unclosed. Waiting for model to finish transition...")
+                        else:
+                            print("✅ UI signal: Generation finished and tags balanced.")
+                            break
+                except Exception as e:
+                    print(f"⚠️ Monitoring error: {e}")
+                
                 await asyncio.sleep(0.5)
         else:
             print("⚠️ Generation start signal not detected. Falling back to timer...")
