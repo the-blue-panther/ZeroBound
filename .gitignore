@@ -12,6 +12,20 @@ __pycache__/
 llm-web-router/profiles/
 Profiles/
 profiles/
+History/
+**/History/
+
+# User Data & Documentation
+Documentation/
+Grok\ Chat/
+workspace/
+
+# Temporary / Debug Scripts
+check_html.py
+setup_and_plot.py
+lean-agent/debug_ui.py
+lean-agent/temp.js
+lean-agent/test_*.py
 
 # Environment / Secret Files
 .env

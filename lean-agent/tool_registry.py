@@ -110,8 +110,8 @@ def write_file(path: str, content: str):
     except Exception as e:
         return {"error": str(e)}
 
-def read_file(path: str):
-    """Reads content from a file relative to CURRENT_WORKSPACE."""
+def read_file(path: str, start_line: int = None, end_line: int = None):
+    """Reads content from a file relative to CURRENT_WORKSPACE. Supports optional line range."""
     if not isinstance(path, str):
         return {"error": "read_file requires 'path' to be a string."}
     try:
@@ -127,18 +127,41 @@ def read_file(path: str):
                 b64 = base64.b64encode(f.read()).decode('ascii')
             return {"content": b64, "is_image": True, "ext": ext.lstrip('.')}
         
-        # Try encodings in order: utf-8-sig strips BOM, utf-16 handles Windows echo-created files
+        content = None
+        # Try encodings in order
         for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'latin-1'):
             try:
                 with open(full_path, 'r', encoding=enc) as f:
                     content = f.read()
-                return {"content": content}
+                break
             except (UnicodeDecodeError, UnicodeError):
                 continue
-        # Final fallback: read as binary and decode lossy
-        with open(full_path, 'rb') as f:
-            content = f.read().decode('utf-8', errors='replace')
-        return {"content": content}
+        
+        if content is None:
+            # Final fallback: read as binary and decode lossy
+            with open(full_path, 'rb') as f:
+                content = f.read().decode('utf-8', errors='replace')
+        
+        lines = content.splitlines()
+        total_lines = len(lines)
+        
+        if start_line is not None or end_line is not None:
+            # Shift to 1-indexed for the user's mental model if needed, but here we assume LLM sends 1-indexed
+            s = (start_line - 1) if start_line else 0
+            e = end_line if end_line else total_lines
+            # Bounds check
+            s = max(0, min(s, total_lines))
+            e = max(0, min(e, total_lines))
+            
+            content = "\n".join(lines[s:e])
+            return {
+                "content": content,
+                "range": [s+1, e],
+                "total_lines": total_lines,
+                "note": f"Showing lines {s+1} to {e} of {total_lines}."
+            }
+            
+        return {"content": content, "total_lines": total_lines}
     except Exception as e:
         return {"error": str(e)}
 
@@ -202,6 +225,69 @@ def get_file_tree(startpath: str = None):
         return tree
 
     return build_tree(startpath)
+
+def grep_search(pattern: str, path: str = ".", case_insensitive: bool = True):
+    """Recursively search for text patterns in the workspace."""
+    results = []
+    root = os.path.abspath(os.path.join(CURRENT_WORKSPACE, path))
+    
+    # Flags for case sensitivity
+    import re
+    flags = re.IGNORECASE if case_insensitive else 0
+    try:
+        regex = re.compile(pattern, flags)
+    except Exception as e:
+        return {"error": f"Invalid regex pattern: {e}"}
+
+    max_results = 100
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune ignored directories
+        dirnames[:] = [d for d in dirnames if d not in IGNORED_TREE_DIRS and d not in TRIMMED_TREE_DIRS]
+        
+        for filename in filenames:
+            full_path = os.path.join(dirpath, filename)
+            rel_path = os.path.relpath(full_path, CURRENT_WORKSPACE)
+            
+            # Skip binary files/known large types
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in {'.png', '.jpg', '.exe', '.dll', '.pyc', '.o', '.bin', '.pdf'}:
+                continue
+
+            try:
+                with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for i, line in enumerate(f, 1):
+                        if regex.search(line):
+                            results.append({
+                                "file": rel_path,
+                                "line": i,
+                                "content": line.strip()
+                            })
+                            if len(results) >= max_results:
+                                return {"results": results, "note": f"Capped at {max_results} results."}
+            except:
+                continue
+                
+    return {"results": results}
+
+def find_files(pattern: str):
+    """Search for files by name globally in the workspace."""
+    import fnmatch
+    results = []
+    max_results = 200
+    
+    for dirpath, dirnames, filenames in os.walk(CURRENT_WORKSPACE):
+        dirnames[:] = [d for d in dirnames if d not in IGNORED_TREE_DIRS and d not in TRIMMED_TREE_DIRS]
+        
+        for filename in filenames:
+            if fnmatch.fnmatch(filename, pattern) or pattern.lower() in filename.lower():
+                rel_path = os.path.relpath(os.path.join(dirpath, filename), CURRENT_WORKSPACE)
+                results.append(rel_path)
+                if len(results) >= max_results:
+                    break
+        if len(results) >= max_results:
+            break
+            
+    return {"files": results, "note": f"Found {len(results)} matches."}
 
 def reveal_in_os(path: str):
     """Opens the host OS file explorer and selects the file/folder."""
@@ -336,7 +422,11 @@ async def handle_tool_call(tool_name, args, callback=None):
         except Exception as e:
             return {"error": str(e)}
     elif tool_name == "read_file":
-        return read_file(args.get("path"))
+        return read_file(args.get("path"), args.get("start_line"), args.get("end_line"))
+    elif tool_name == "grep_search":
+        return grep_search(args.get("pattern"), args.get("path", "."), args.get("case_insensitive", True))
+    elif tool_name == "find_files":
+        return find_files(args.get("pattern"))
     elif tool_name == "list_files":
         return list_files(args.get("path", "."))
     elif tool_name == "reveal_in_os":
@@ -394,13 +484,39 @@ TOOLS = [
     },
     {
         "name": "read_file",
-        "description": "Read a file's content directly. Returns content or an error if missing — do NOT call list_files first to check existence. Just call this directly.",
+        "description": "Read a file's content. Supports mandatory full read or optional line range for large files.",
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path to the file (relative to workspace or absolute)."}
+                "path": {"type": "string", "description": "Path to the file."},
+                "start_line": {"type": "integer", "description": "1-indexed start line (optional)."},
+                "end_line": {"type": "integer", "description": "1-indexed end line (optional)."}
             },
             "required": ["path"]
+        }
+    },
+    {
+        "name": "grep_search",
+        "description": "Aggressively search for text patterns across the entire project. Use this for discovery or finding function definitions in large codebases. Respects .git/venv ignores.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "The text or regex to search for."},
+                "path": {"type": "string", "description": "Subdirectory to search in (defaults to root)."},
+                "case_insensitive": {"type": "boolean", "description": "Default true."}
+            },
+            "required": ["pattern"]
+        }
+    },
+    {
+        "name": "find_files",
+        "description": "Find files by name or glob pattern across the entire project.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "The filename pattern to find (e.g. 'auth*.py' or 'utils')."}
+            },
+            "required": ["pattern"]
         }
     },
     {
@@ -425,3 +541,21 @@ TOOLS = [
         }
     }
 ]
+
+def get_tools_prompt_description():
+    """Returns a string description of all available tools for inclusion in the system prompt."""
+    desc = "--- AVAILABLE TOOLS ---\n"
+    for tool in TOOLS:
+        name = tool["name"]
+        params = tool.get("parameters", {}).get("properties", {})
+        required = tool.get("parameters", {}).get("required", [])
+        
+        param_list = []
+        for p_name, p_info in params.items():
+            req_star = "*" if p_name in required else ""
+            p_type = p_info.get("type", "any")
+            param_list.append(f"{p_name}{req_star} ({p_type})")
+            
+        params_str = ", ".join(param_list)
+        desc += f"• {name}({params_str}): {tool['description']}\n"
+    return desc

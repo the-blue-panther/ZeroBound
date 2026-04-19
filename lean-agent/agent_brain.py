@@ -3,7 +3,7 @@ import json
 import re
 import asyncio
 from litellm import acompletion
-from tool_registry import TOOLS, handle_tool_call
+from tool_registry import TOOLS, handle_tool_call, get_tools_prompt_description
 
 # Configure LiteLLM to use the local router
 # We provide a dummy key as the router doesn't validate it
@@ -20,13 +20,25 @@ TAG_REPORT = "REPORT"
 
 
 # ─── System Prompt ────────────────────────────────────────────────────────────
+PROMPT_VERSION = "1.1.0"
 
 def build_system_prompt(workspace: str) -> str:
     """Full system prompt — sent as the first message on every API call."""
+    tools_desc = get_tools_prompt_description()
+    
+    # DEBUG: Print the generated prompt once to verify tool list inclusion
+    # print(f"\n[DEBUG] Full System Prompt (v{PROMPT_VERSION}):\n{'-'*40}\n{tools_desc}\n{'-'*40}\n")
+    
     return (
-        "--- IDENTITY ---\n"
-        "You are ZeroBound, a high-autonomy engineering agent. "
+        f"--- IDENTITY (v{PROMPT_VERSION}) ---\n"
+        f"Current Workspace: {workspace}\n"
+        "You are ZeroBound, a high-autonomy engineering agent and expert software engineer. "
         "You have full terminal and file-system access on Windows.\n\n"
+
+        "--- LOCATION & PATHS (CRITICAL) ---\n"
+        "• 'The root folder' or 'root' refers to the CURRENT WORKSPACE, NOT the drive root (C:\\).\n"
+        "• All file operations (read/write/list) are RELATIVE to the Current Workspace by default.\n"
+        "• NEVER set the workspace to 'C:\\' unless explicitly commanded to work on the entire drive root.\n\n"
 
         "--- RESPONSE FORMAT (MANDATORY — EVERY RESPONSE) ---\n"
         "Structure EVERY response using EXACTLY this format:\n\n"
@@ -44,10 +56,21 @@ def build_system_prompt(workspace: str) -> str:
         "[Your response to the user — clear, concise, markdown-formatted]\n"
         "</REPORT>\n\n"
         "STRICT RULES:\n"
+        "• ACT DECISIVELY. Keep <THINK> sections concise and strictly about the logic of the next step. "
+        "Avoid long narratives that might risk UI truncation.\n"
         "• NEVER skip <THINK>.\n"
         "• Each response has EXACTLY ONE <ACTION> or ONE <REPORT>, never both, never neither.\n"
-        "• NEVER produce bare text outside these tags.\n"
-        "• Inside <REPORT>, use full Markdown including LaTeX math ($...$ and $$...$$) when appropriate.\n\n"
+        "• To avoid network/UI timeouts, prioritize emitting the <ACTION> block immediately after your thought.\n\n"
+        
+        f"{tools_desc}\n"
+
+        "--- LARGE PROJECT SCALING & DISCOVERY ---\n"
+        "When working in large or unfamiliar codebases:\n"
+        "1. USE `find_files` to locate files by name if you have a guess (e.g., 'utils', 'config').\n"
+        "2. USE `grep_search` to find where functions are defined or where specific constants are used.\n"
+        "3. FOR LARGE FILES (> 300 lines): Use `read_file` with `start_line` and `end_line` to read specific snippets. "
+        "Do NOT read the whole file if you only need one function.\n"
+        "4. NEVER guess file contents. Always use the search tools to verify your assumptions.\n\n"
 
         "--- EXECUTION PHILOSOPHY ---\n"
         "ACT DECISIVELY. Do NOT waste steps on redundant verification.\n\n"
@@ -79,16 +102,18 @@ def build_system_prompt(workspace: str) -> str:
         "If it contradicts earlier instructions, THE LATEST MESSAGE WINS.\n"
         "Do NOT fixate on earlier goals if the user has given new instructions.\n\n"
 
-        f"--- WORKSPACE ---\n"
-        f"Current workspace: {workspace}\n"
-        "Use set_workspace to change it.\n\n"
-
-        "--- TOOL SYNTAX ---\n"
-        "CALL: tool_name({\"arg\": \"val\"})\n"
+        "--- TOOL SYNTAX (STRICT JSON) ---\n"
+        "To invoke a tool, use EXACTLY this syntax inside <ACTION> tags:\n"
+        "CALL: tool_name({\"arg\": \"val\"})\n\n"
+        "STRICT JSON RULES:\n"
+        "1. Arguments MUST be a single-line valid JSON object.\n"
+        "2. JSON keys and string values MUST use double quotes (\"). Single quotes are NOT allowed.\n"
+        "3. Use \\n for literal newlines within string values.\n"
+        "4. Do NOT include any text, notes, or prefixes before 'CALL:' or after the closing ')'.\n\n"
         "Examples:\n"
-        "  CALL: run_shell_command({\"command\": \"pip install numpy\"})\n"
-        "  CALL: write_file({\"path\": \"notes.md\", \"content\": \"# Hello\\n\\nWorld\"})\n"
-        "  CALL: read_file({\"path\": \"notes.md\"})\n"
+        "  CALL: run_shell_command({\"command\": \"dir\"})\n"
+        "  CALL: write_file({\"path\": \"hello.txt\", \"content\": \"Hello\\nWorld\"})\n"
+        "  CALL: read_file({\"path\": \"config.json\"})\n"
     )
 
 
@@ -108,75 +133,93 @@ def build_reinforcement_prompt(workspace: str, latest_user_msg: str) -> str:
 
 # ─── Response Parser ─────────────────────────────────────────────────────────
 
+def strip_all_tags(text: str) -> str:
+    """Aggressively removes all known agent tags from text."""
+    if not text: return ""
+    return re.sub(r'</?(?:THINK|ACTION|REPORT)>', '', text, flags=re.IGNORECASE).strip()
+
 def parse_structured_response(text: str):
     """Parse the LLM's response into think/action/report components.
     
     Returns a dict:
       { "think": str|None, "action": {"tool": str, "args": dict}|None, "report": str|None }
-    
-    Gracefully handles malformed output by falling back to legacy CALL: parsing.
     """
     result = {"think": None, "action": None, "report": None}
-    
-    if not text:
-        return result
+    if not text: return result
 
-    # Extract <THINK> block
-    think_match = re.search(r'<THINK>(.*?)</THINK>', text, re.DOTALL)
+    # 1. Extract <THINK> block
+    think_match = re.search(r'<THINK>(.*?)</THINK>', text, re.DOTALL | re.IGNORECASE)
+    if not think_match:
+        # Fallback: maybe it didn't close?
+        think_match = re.search(r'<THINK>(.*)', text, re.DOTALL | re.IGNORECASE)
+    
     if think_match:
         result["think"] = think_match.group(1).strip()
+        # Remove tags if they leaked into the content
+        result["think"] = strip_all_tags(result["think"])
 
-    # Extract <REPORT> block
-    report_match = re.search(r'<REPORT>(.*?)</REPORT>', text, re.DOTALL)
+    # 2. Extract <REPORT> block
+    report_match = re.search(r'<REPORT>(.*?)</REPORT>', text, re.DOTALL | re.IGNORECASE)
     if report_match:
-        result["report"] = report_match.group(1).strip()
-        return result  # If there's a REPORT, ignore any ACTION
+        result["report"] = strip_all_tags(report_match.group(1).strip())
+        return result
 
-    # Extract <ACTION> block (Greedy: matches even if closing tag is missing)
-    action_match = re.search(r'<ACTION>(.*?)(?:</ACTION>|$)', text, re.DOTALL)
+    # 3. Extract <ACTION> block (Greedy)
+    action_match = re.search(r'<ACTION>(.*?)(?:</ACTION>|$)', text, re.DOTALL | re.IGNORECASE)
     action_text = action_match.group(1).strip() if action_match else None
 
-    # If no structured tags found at all, fall back to legacy CALL: parsing
+    # 4. Fallback: If no tags, look for CALL: (legacy support)
     if not action_text and not result["think"] and not result["report"]:
-        # Legacy fallback: look for CALL: anywhere in text
-        action_text = text
-        # Treat everything before CALL: as thinking
-        call_split = text.split("CALL:", 1)
-        if len(call_split) > 1:
-            result["think"] = call_split[0].strip() or None
+        if "CALL:" in text:
+            call_split = text.split("CALL:", 1)
+            result["think"] = strip_all_tags(call_split[0])
             action_text = "CALL:" + call_split[1]
         else:
-            # No tool call, no tags — treat entire response as report
-            result["report"] = text.strip()
+            result["report"] = strip_all_tags(text)
             return result
-    
-    if not action_text:
-        # Has <THINK> but no <ACTION> or <REPORT> — treat as incomplete, 
-        # but still usable (model forgot to wrap report)
+
+    # 5. Parse the tool call
+    if action_text:
+        tool_name, args = _parse_tool_call(action_text)
+        if tool_name:
+            result["action"] = {"tool": tool_name, "args": args}
+        else:
+            # Action block exists but CALL: parsing failed
+            # Try to treat the action text as a report to avoid losing data, but strip tags!
+            result["report"] = strip_all_tags(action_text)
+    elif result["think"]:
+        # Has THINK but no ACTION/REPORT. Treat the rest of message as report.
         remaining = text
         if think_match:
             remaining = text[think_match.end():].strip()
         if remaining:
-            result["report"] = remaining
-        return result
-
-    # Parse CALL: from action_text
-    tool_name, args = _parse_tool_call(action_text)
-    if tool_name:
-        result["action"] = {"tool": tool_name, "args": args}
-    else:
-        # Failed to parse tool call — treat action text as report
-        if not result["report"]:
-            result["report"] = text.strip()
-
+            result["report"] = strip_all_tags(remaining)
+    
+    # --- FINAL FALLBACK (No tags found or parsing failed) ---
+    if not result["action"] and not result["report"]:
+        print(f"WARNING: No structured tags found. Searching raw text for CALL: pattern...")
+        tool_name, args = _parse_tool_call(text)
+        if tool_name:
+            result["action"] = {"tool": tool_name, "args": args}
+        else:
+            # Absolute fallback: treat everything as a report
+            result["report"] = strip_all_tags(text)
+    
     return result
 
 
 def _parse_tool_call(text: str):
     """Extract tool_name and args dict from text containing CALL: tool({...})"""
-    match = re.search(r'CALL:\s*(\w+)\s*\((.+)\)', text, re.DOTALL)
+    # More robust regex: handle missing closing paren or trailing text
+    match = re.search(r'CALL:\s*(\w+)\s*\((.*)', text, re.DOTALL | re.IGNORECASE)
     if not match:
         return None, {}
+    
+    tool_name = match.group(1)
+    args_raw = match.group(2).strip()
+    
+    # If it ends with </ACTION> or other tags, strip them first from the raw args
+    args_raw = strip_all_tags(args_raw)
     
     tool_name = match.group(1)
     args_raw = match.group(2).strip()
@@ -509,7 +552,7 @@ if __name__ == "__main__":
             print(f"\n[AGENT] {data['content']}\n")
 
     async def main():
-        print("Welcome to AntiGravity-Lean CLI.")
+        print("Welcome to ZeroBound CLI.")
         while True:
             u = input("> ")
             if u.lower() in ["exit", "quit"]: break

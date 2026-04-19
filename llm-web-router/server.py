@@ -206,12 +206,34 @@ async def get_response(page, cfg, prompt: str, image_urls=None):
     # --- PHASE 3: Stability Buffer ---
     print("⏳ Finalizing content...")
     last_text = ""
-    for _ in range(5): # Extra 2.5s buffer for Markdown rendering/late frames
+    stable_iterations = 0
+    # Wait for up to 10 seconds of stability, checking every 0.5s
+    # We require 4 consecutive stable checks (2.0s) to be sure DeepSeek finished its transition
+    for _ in range(20): 
         await asyncio.sleep(0.5)
-        current = await page.locator(cfg["response_container"]).last.inner_text()
-        if current == last_text and current:
+        try:
+            current = await page.locator(cfg["response_container"]).last.inner_text()
+            if current == last_text and current:
+                stable_iterations += 1
+            else:
+                stable_iterations = 0
+            
+            if stable_iterations >= 4:
+                # One final check: Is the attachment button still disabled?
+                # If it's enabled, we are definitely done.
+                if "attachment_selector" in cfg:
+                    is_disabled = await page.locator(cfg["attachment_selector"]).evaluate("(el) => el.classList.contains('ds-icon-button--disabled')")
+                    if not is_disabled:
+                        print("✅ Generation stable and UI idle.")
+                        break
+                else:
+                    print("✅ Content finalized.")
+                    break
+                    
+            last_text = current
+        except Exception as e:
+            print(f"⚠️ Error during stabilization: {e}")
             break
-        last_text = current
             
     return last_text
 
