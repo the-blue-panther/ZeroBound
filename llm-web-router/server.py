@@ -194,10 +194,21 @@ async def get_response(page, cfg, prompt: str, image_urls=None):
         
         if started:
             # 2. Wait for "Typing" to finish (max 180s for huge files)
+            print("⏳ Monitoring content for completion tags (</ACTION> or </REPORT>)...")
             for _ in range(360):
                 is_disabled = await page.locator(cfg["attachment_selector"]).evaluate("(el) => el.classList.contains('ds-icon-button--disabled')")
+                
+                # Check for explicit termination tokens in the text
+                try:
+                    current_text = await page.locator(cfg["response_container"]).last.inner_text()
+                    if "</ACTION>" in current_text or "</REPORT>" in current_text:
+                        print("🎯 Detected completion tag. Generation looks complete.")
+                        break
+                except:
+                    pass
+
                 if not is_disabled:
-                    print("✅ Generation finished (UI signal).")
+                    print("✅ UI signal: Generation finished.")
                     break
                 await asyncio.sleep(0.5)
         else:

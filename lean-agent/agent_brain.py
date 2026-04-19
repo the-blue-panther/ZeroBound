@@ -60,7 +60,8 @@ def build_system_prompt(workspace: str) -> str:
         "Avoid long narratives that might risk UI truncation.\n"
         "• NEVER skip <THINK>.\n"
         "• Each response has EXACTLY ONE <ACTION> or ONE <REPORT>, never both, never neither.\n"
-        "• To avoid network/UI timeouts, prioritize emitting the <ACTION> block immediately after your thought.\n\n"
+        "• To avoid network/UI timeouts, prioritize emitting the <ACTION> block immediately after your thought.\n"
+        "• CRITICAL: ALWAYS close your tags (e.g., </ACTION> or </REPORT>). The system uses these tokens as a hard signal to begin execution. If you omit them, the system may wait too long or fail to process your action.\n\n"
         
         f"{tools_desc}\n"
 
