@@ -27,8 +27,8 @@ ZeroBound is an ultra-robust, state-driven autonomous coding assistant. It bridg
 
 1. Clone the repository
    bash
- git clone https://github.com/yourusername/zero-bound.git
- cd zero-bound
+ git clone https://github.com/the-blue-panther/ZeroBound.git
+ cd ZeroBound
 
 
 2. Set up Python virtual environment
@@ -175,39 +175,39 @@ Safe commands (no approval needed for run_shell_command):
 
 ZeroBound runs as three coordinated processes:
 
-
-┌─────────────────────────────────────────────────────────────┐
+text
+┌─────────────────────────────────────────────────────────────────────┐
 │ USER'S BROWSER (Dashboard) │
-│ ┌──────────┐ ┌──────────────┐ ┌──────────────────────┐ │
+│ ┌────────────┐ ┌──────────────┐ ┌────────────────────────────┐ │
 │ │ Chat │ │Monaco Editor │ │ Agent Shell / │ │
 │ │ Panel │ │ (File Viewer)│ │ Terminal (Live) │ │
-│ └──────────┘ └──────────────┘ └──────────────────────┘ │
-└──────────────────────────┬──────────────────────────────────┘
+│ └────────────┘ └──────────────┘ └────────────────────────────┘ │
+└───────────────────────────────┬─────────────────────────────────────┘
  │ WebSocket (port 8001)
-┌──────────────────────────▼──────────────────────────────────┐
+┌───────────────────────────────▼─────────────────────────────────────┐
 │ SERVER BRIDGE (server_bridge.py) │
 │ - WebSocket hub (non-blocking agent execution) │
 │ - Session persistence & history management │
 │ - Approval future resolution │
-└──────────────────────────┬──────────────────────────────────┘
+└───────────────────────────────┬─────────────────────────────────────┘
  │ Function calls
-┌──────────────────────────▼──────────────────────────────────┐
+┌───────────────────────────────▼─────────────────────────────────────┐
 │ AGENT BRAIN (agent_brain.py) │
 │ - Conversation history (trimmed for context) │
 │ - ReAct loop + tool call parsing │
 │ - Multi-call truncation + brace-counting JSON extraction │
 │ - Approval gating & future awaiting │
-└──────────┬───────────────────────────────┬──────────────────┘
+└───────────────┬───────────────────────────────┬─────────────────────┘
  │ HTTP (port 8000) │ Tool execution
-┌──────────▼──────────┐ ┌──────────▼──────────────────┐
+┌───────────────▼───────────────┐ ┌───────────────▼─────────────────────┐
 │ LLM-WEB-ROUTER │ │ TOOL REGISTRY │
 │ (server.py) │ │ (tool_registry.py) │
-│ - FastAPI + │ │ - File system ops │
-│ Playwright │ │ - Shell execution (threaded)│
-│ - Edge automation │ │ - Web search/URL fetch │
-│ - Response polling │ │ - Browser automation │
-│ & stabilization │ │ - Memory & knowledge base │
-└─────────────────────┘ └─────────────────────────────┘
+│ - FastAPI + Playwright │ │ - File system ops │
+│ - Edge automation │ │ - Shell execution (threaded) │
+│ - Response polling │ │ - Web search/URL fetch │
+│ & stabilization │ │ - Browser automation │
+└───────────────────────────────┘ │ - Memory & knowledge base │
+ └─────────────────────────────────────┘
 
 
 Key design decisions:
@@ -220,8 +220,8 @@ Key design decisions:
 
 ## 📂 Project Structure
 
-
-zero-bound/
+text
+ZeroBound/
 ├── lean-agent/ # Core agent system
 │ ├── agent_brain.py # ReAct loop + LLM orchestration
 │ ├── server_bridge.py # WebSocket server (port 8001) + UI host
