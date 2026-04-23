@@ -1,7 +1,9 @@
 # ZeroBound – Lightweight Browser-Based Coding Agent
 
 https://img.shields.io/badge/License-MIT-yellow.svg
+
 https://img.shields.io/badge/python-3.11+-blue.svg
+
 https://img.shields.io/badge/status-active-success.svg
 
 ZeroBound is an ultra-robust, state-driven autonomous coding assistant. It bridges the gap between raw LLM capabilities and reliable engineering workflows by automating real browser sessions on free AI platforms (DeepSeek, Claude) and turning them into a full-capability local agent with:
