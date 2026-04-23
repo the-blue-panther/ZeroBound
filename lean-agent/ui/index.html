@@ -8,7 +8,7 @@
     <link
         href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
         rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
     <!-- Syntax Highlighting -->
     <link rel="stylesheet"
         href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
@@ -38,6 +38,20 @@
             --warning: #f59e0b;
             --sidebar-w: 270px;
             --chat-w: 390px;
+        }
+
+        .agent-tag {
+            display: inline-block;
+            background-color: #252840;
+            color: #d63384;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 1px 5px;
+            border-radius: 4px;
+            margin: 0 2px;
+            border: 1px solid rgba(214, 51, 132, 0.3);
+            text-transform: uppercase;
         }
 
         * {
@@ -1364,7 +1378,7 @@
         }
 
         .md-body p {
-            margin: 0.4em 0;
+            margin: 0 0 1.25em 0;
         }
 
         .md-body h1,
@@ -1396,7 +1410,7 @@
         .md-body ul,
         .md-body ol {
             padding-left: 1.5em;
-            margin: 0.4em 0;
+            margin: 0 0 1.25em 0;
         }
 
         .md-body li {
@@ -1799,18 +1813,32 @@
         // Strip any leaked structured-output tags from agent content
         function stripAgentTags(text) {
             if (!text) return '';
-            // Aggressively strip any XML-like tags (THINK, ACTION, REPORT) case-insensitively
-            return text
-                .replace(/<\/?(THINK|ACTION|REPORT|REINFORCEMENT)>/gi, '')
-                .trim();
+            // Non-destructive passthrough: renderMarkdown handles the actual escaping/styling.
+            // This function is kept for backward compatibility but no longer strips.
+            return text;
+        }
+
+        function escapeHtml(text) {
+            if (!text) return '';
+            return text.replace(/[&<>]/g, (char) => {
+                if (char === '&') return '&amp;';
+                if (char === '<') return '&lt;';
+                if (char === '>') return '&gt;';
+                return char;
+            });
         }
 
         function renderMarkdown(text) {
             if (typeof marked === 'undefined') return text || '';
 
-            // Pre-process: protect LaTeX from marked's escaping
+            // STEP 1: Escape agent tags to prevent stripping
+            let escaped = (text || '')
+                .replace(/<(THINK|REPORT|REINFORCEMENT)>/gi, '&lt;$1&gt;')
+                .replace(/<\/(THINK|REPORT|REINFORCEMENT)>/gi, '&lt;/$1&gt;');
+
+            // STEP 2: Protect LaTeX math
             const mathBlocks = [];
-            let processed = (text || '')
+            let processed = escaped
                 .replace(/\$\$([\s\S]+?)\$\$/g, (_, math) => {
                     mathBlocks.push({ type: 'block', math });
                     return `<MATHBLOCK${mathBlocks.length - 1}>`;
@@ -1820,15 +1848,37 @@
                     return `<MATHINLINE${mathBlocks.length - 1}>`;
                 });
 
-            let html = marked.parse(processed);
+            // STEP 3: Configure marked for proper code blocks
+            const renderer = new marked.Renderer();
+            renderer.code = (code, language) => {
+                // Optional: Add syntax highlighting with hljs
+                if (typeof hljs !== 'undefined' && language && hljs.getLanguage(language)) {
+                    try {
+                        const highlighted = hljs.highlight(code, { language }).value;
+                        return `<pre><code class="hljs language-${language}">${highlighted}</code></pre>`;
+                    } catch (e) {}
+                }
+                // Fallback to plain code block
+                return `<pre><code class="language-${language || 'text'}">${escapeHtml(code)}</code></pre>`;
+            };
 
+            // STEP 4: Parse markdown
+            let html = marked.parse(processed, { renderer });
+
+            // STEP 5: Restore math
             if (typeof katex !== 'undefined') {
                 html = html.replace(/<MATHBLOCK(\d+)>/g, (_, i) => {
-                    try { return katex.renderToString(mathBlocks[i].math, { displayMode: true, throwOnError: false }); } catch (e) { return mathBlocks[i].math; }
+                    try { return katex.renderToString(mathBlocks[i].math, { displayMode: true, throwOnError: false }); } 
+                    catch (e) { return mathBlocks[i].math; }
                 }).replace(/<MATHINLINE(\d+)>/g, (_, i) => {
-                    try { return katex.renderToString(mathBlocks[i].math, { displayMode: false, throwOnError: false }); } catch (e) { return '$' + mathBlocks[i].math + '$'; }
+                    try { return katex.renderToString(mathBlocks[i].math, { displayMode: false, throwOnError: false }); } 
+                    catch (e) { return '$' + mathBlocks[i].math + '$'; }
                 });
             }
+
+            // STEP 6: Restore agent tags as styled spans
+            html = html.replace(/&lt;(THINK|REPORT|REINFORCEMENT)&gt;/gi, '<span class="agent-tag">&lt;$1&gt;</span>');
+            html = html.replace(/&lt;\/(THINK|REPORT|REINFORCEMENT)&gt;/gi, '<span class="agent-tag">&lt;/$1&gt;</span>');
 
             return html;
         }
@@ -2197,7 +2247,7 @@
                 const elapsed = thinkStartTime ? Math.round((Date.now() - thinkStartTime) / 1000) : 0;
                 thinkStartTime = Date.now(); // Reset for next thought
                 const label = elapsed > 0 ? `🧠 Reasoned for ${elapsed}s` : '🧠 Reasoning';
-                const cleanContent = stripAgentTags(data.content || '');
+                const cleanContent = data.content || '';
                 row.innerHTML = `
             <div class="think-header" style="display:flex;align-items:center;">
                 <button class="think-toggle" onclick="this.classList.toggle('open'); this.parentElement.nextElementSibling.classList.toggle('visible')">
@@ -2240,7 +2290,7 @@
             else if (data.type === "final_response") {
                 activeThought = null;
                 setAgentRunning(false);
-                renderMsg('assistant', stripAgentTags(data.content));
+                renderMsg('assistant', data.content);
             }
             else if (data.type === "agent_stopped") {
                 activeThought = null;
@@ -2348,7 +2398,7 @@
                 ? `<span style="white-space:pre-wrap">${(content || '').replace(/</g, '&lt;')}</span>`
                 : renderMarkdown(content || '');
             entry.innerHTML = `
-        <div class="chat-role-label ${role}">${isUser ? '👤 You' : '⚛️ AntiGravity'}</div>
+        <div class="chat-role-label ${role}">${isUser ? '👤 You' : '⚛️ ZeroBound agent'}</div>
         <div class="chat-text ${role} md-body">${imgHTML}${renderedContent}</div>
     `;
             if (!isUser) {

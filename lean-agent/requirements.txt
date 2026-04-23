@@ -4,3 +4,4 @@ uvicorn
 python-dotenv
 requests
 colorama
+playwright

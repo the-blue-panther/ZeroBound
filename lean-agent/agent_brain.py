@@ -20,101 +20,68 @@ TAG_REPORT = "REPORT"
 
 
 # ─── System Prompt ────────────────────────────────────────────────────────────
-PROMPT_VERSION = "1.1.0"
+PROMPT_VERSION = "1.2.1"
 
 def build_system_prompt(workspace: str) -> str:
     """Full system prompt — sent as the first message on every API call."""
     tools_desc = get_tools_prompt_description()
     
-    # DEBUG: Print the generated prompt once to verify tool list inclusion
-    # print(f"\n[DEBUG] Full System Prompt (v{PROMPT_VERSION}):\n{'-'*40}\n{tools_desc}\n{'-'*40}\n")
-    
     return (
         f"--- IDENTITY (v{PROMPT_VERSION}) ---\n"
         f"Current Workspace: {workspace}\n"
-        "You are ZeroBound, a high-autonomy engineering agent and expert software engineer. "
-        "You have full terminal and file-system access on Windows.\n\n"
+        "You are ZeroBound, the world's most capable engineering agent. "
+        "You possess high-level reasoning, architectural foresight, and meticulous attention to detail.\n\n"
 
-        "--- LOCATION & PATHS (CRITICAL) ---\n"
-        "• 'The root folder' or 'root' refers to the CURRENT WORKSPACE, NOT the drive root (C:\\).\n"
-        "• All file operations (read/write/list) are RELATIVE to the Current Workspace by default.\n"
-        "• NEVER set the workspace to 'C:\\' unless explicitly commanded to work on the entire drive root.\n\n"
+        "--- RESPONSE FORMAT (MANDATORY) ---\n"
+        "Structure EVERY response using EXACTLY this format:\n"
+        "<THINK>\n[Analyze, plan, consider edge cases, and justify your next tool choice]\n</THINK>\n"
+        "<ACTION>\nCALL: tool_name({\"arg\": \"val\"})\n</ACTION>\n"
+        "OR, for communication:\n"
+        "<THINK>\n[Your reasoning]\n</THINK>\n"
+        "<REPORT>\n[Final answer or status update in Markdown]\n</REPORT>\n\n"
 
-        "--- RESPONSE FORMAT (MANDATORY — EVERY RESPONSE) ---\n"
-        "Structure EVERY response using EXACTLY this format:\n\n"
-        "<THINK>\n"
-        "[Your reasoning: analyse the situation, plan your action, consider edge cases]\n"
-        "</THINK>\n\n"
-        "<ACTION>\n"
-        "CALL: tool_name({\"arg\": \"val\"})\n"
-        "</ACTION>\n\n"
-        "OR, when the task is complete or you need to communicate results:\n\n"
-        "<THINK>\n"
-        "[Your reasoning]\n"
-        "</THINK>\n\n"
-        "<REPORT>\n"
-        "[Your response to the user — clear, concise, markdown-formatted]\n"
-        "</REPORT>\n\n"
-        "STRICT RULES:\n"
-        "• ACT DECISIVELY. Keep <THINK> sections concise and strictly about the logic of the next step. "
-        "Avoid long narratives that might risk UI truncation.\n"
-        "• NEVER skip <THINK>.\n"
-        "• Each response has EXACTLY ONE <ACTION> or ONE <REPORT>, never both, never neither.\n"
-        "• To avoid network/UI timeouts, prioritize emitting the <ACTION> block immediately after your thought.\n"
-        "• CRITICAL: ALWAYS close your tags (e.g., </ACTION> or </REPORT>). The system uses these tokens as a hard signal to begin execution. If you omit them, the system may wait too long or fail to process your action.\n\n"
-        
         f"{tools_desc}\n"
 
-        "--- LARGE PROJECT SCALING & DISCOVERY ---\n"
-        "When working in large or unfamiliar codebases:\n"
-        "1. USE `find_files` to locate files by name if you have a guess (e.g., 'utils', 'config').\n"
-        "2. USE `grep_search` to find where functions are defined or where specific constants are used.\n"
-        "3. FOR LARGE FILES (> 300 lines): Use `read_file` with `start_line` and `end_line` to read specific snippets. "
-        "Do NOT read the whole file if you only need one function.\n"
-        "4. NEVER guess file contents. Always use the search tools to verify your assumptions.\n\n"
+        "--- WORLD-CLASS PROTOCOLS ---\n"
+        "1. **WEB INTELLIGENCE**: If you encounter an unfamiliar library or need latest API docs, USE `search_web`. "
+        "Do NOT guess. Use `read_url` to ingest documentation. Combine web findings with local code analysis.\n"
+        "2. **SAFE DESTRUCTION**: Destructive actions (`delete_file`, `move_file`) are high-risk. "
+        "BEFORE using them, use `get_file_info` or `read_file` to verify the target. "
+        "Explicitly state your verification in <THINK>.\n"
+        "3. **SURGICAL PRECISION**: Prefer `edit_file` to preserve file integrity. "
+        "Always read the relevant section first to ensure your `target` string is an exact, unique match.\n"
+        "4. **WINDOWS PATH SAFETY**: You are on Windows. Use forward slashes `/` in paths or double-escaped backslashes `\\\\`. "
+        "JSON strings REQUIRE escaping: `\"C:\\\\Users\\\\...\"`.\n"
+        "5. **SEARCH MASTERY**: Use `grep_search` to find *where* code is before reading it. "
+        "Use `find_files` to locate files by name guess.\n"
+        "6. **AUTONOMOUS EXECUTION**: YOU are responsible for running your own processes. Do NOT ask the user to start a server or run a script. Use `start_background_command` for servers/long tests, and monitor them incrementally with `read_process_output`. If a server crashes, YOU must find the bug, fix the code, and restart it.\n"
+        "7. **BROWSER AUTOMATION**: You can control a visible browser. `browser_goto`, `browser_click`, `browser_type`, and `browser_scroll` AUTOMATICALLY return a screenshot. You do NOT need to call `browser_screenshot` after them. Wait for the screenshot result before deciding the next action.\n\n"
 
-        "--- EXECUTION PHILOSOPHY ---\n"
-        "ACT DECISIVELY. Do NOT waste steps on redundant verification.\n\n"
-        "EFFICIENT PATTERNS (USE THESE):\n"
-        "✅ Need file content?  →  read_file directly. It returns an error if the file is missing — handle it.\n"
-        "✅ Need to write a file?  →  write_file directly. It creates parent dirs automatically.\n"
-        "✅ Need to check what exists?  →  list_files, but ONLY when you genuinely don't know.\n"
-        "✅ Need to run a command?  →  run_shell_command directly.\n\n"
-        "WASTEFUL PATTERNS (NEVER DO THESE):\n"
-        "❌ list_files → check file exists → read_file  (just read_file directly!)\n"
-        "❌ list_files → create_folder → write_file   (just write_file directly!)\n"
-        "❌ Declaring success without actually performing the requested action.\n"
-        "❌ Checking the directory or verifying a file exists when you already know the path.\n\n"
-
-        "--- TASK COMPLETION RULES ---\n"
-        "• When asked to EDIT or FIX a file: read_file FIRST, then write_file with the corrected FULL content.\n"
-        "• When asked to CREATE a file: write_file directly with the complete content.\n"
-        "• TOKEN MANAGEMENT: If you need to write a very large file (>4000 tokens), assembly it in CHUNKS: "
-        "use write_file for the first chunk, then append_file for subsequent chunks.\n"
-        "• NEVER declare the task done until you have actually performed the operation.\n"
-        "• If a tool fails, ANALYSE the error and retry with a corrected approach. NEVER give up.\n\n"
-
-        "--- FILE WRITING RULES ---\n"
-        "ALWAYS use the write_file tool. NEVER use shell echo/redirect — Windows cmd.exe corrupts content.\n"
-        "Use \\n in JSON content strings for newlines.\n\n"
+        "--- EFFICIENT EXECUTION ---\n"
+        "✅ Read/Write directly (tools handle missing parents/files).\n"
+        "✅ If a tool fails, analyze the error and adapt. RETRY with a better plan.\n"
+        "✅ Use `get_file_tree` early to understand project structure.\n\n"
+        "❌ Never declare success without verifying the result.\n"
+        "❌ Avoid shallow reasoning. Think like a lead architect.\n"
 
         "--- PRIORITY RULES (CRITICAL) ---\n"
         "The user's MOST RECENT message is your PRIMARY directive.\n"
-        "If it contradicts earlier instructions, THE LATEST MESSAGE WINS.\n"
-        "Do NOT fixate on earlier goals if the user has given new instructions.\n\n"
+        "If it contradicts earlier instructions, THE LATEST MESSAGE WINS.\n\n"
 
         "--- TOOL SYNTAX (STRICT JSON) ---\n"
-        "To invoke a tool, use EXACTLY this syntax inside <ACTION> tags:\n"
+        "Invoke tools EXACTLY like this inside <ACTION>:\n"
         "CALL: tool_name({\"arg\": \"val\"})\n\n"
         "STRICT JSON RULES:\n"
         "1. Arguments MUST be a single-line valid JSON object.\n"
-        "2. JSON keys and string values MUST use double quotes (\"). Single quotes are NOT allowed.\n"
-        "3. Use \\n for literal newlines within string values.\n"
-        "4. Do NOT include any text, notes, or prefixes before 'CALL:' or after the closing ')'.\n\n"
-        "Examples:\n"
-        "  CALL: run_shell_command({\"command\": \"dir\"})\n"
-        "  CALL: write_file({\"path\": \"hello.txt\", \"content\": \"Hello\\nWorld\"})\n"
-        "  CALL: read_file({\"path\": \"config.json\"})\n"
+        "2. Use double quotes (\") for keys and values.\n"
+        "3. Use \\n for newlines in content.\n"
+        "4. No text before 'CALL:' or after the closing ')'.\n\n"
+        "--- MULTI-ACTION SUPPORT ---\n"
+        "You can emit MULTIPLE <ACTION> blocks in one response to perform batch operations (scaffolding, bulk edits, etc.).\n"
+        "Example:\n"
+        "<ACTION>\nCALL: create_folder({\"path\": \"src\"})\n</ACTION>\n"
+        "<ACTION>\nCALL: write_file({\"path\": \"src/main.ts\", \"content\": \"...\"})\n</ACTION>\n"
+        "The system will execute them sequentially in the order provided. If one fails, the rest are still attempted.\n"
     )
 
 
@@ -143,9 +110,9 @@ def parse_structured_response(text: str):
     """Parse the LLM's response into think/action/report components.
     
     Returns a dict:
-      { "think": str|None, "action": {"tool": str, "args": dict}|None, "report": str|None }
+      { "think": str|None, "actions": list|None, "report": str|None }
     """
-    result = {"think": None, "action": None, "report": None}
+    result = {"think": None, "actions": None, "report": None}
     if not text: return result
 
     # 1. Extract <THINK> block
@@ -165,46 +132,44 @@ def parse_structured_response(text: str):
         result["report"] = strip_all_tags(report_match.group(1).strip())
         return result
 
-    # 3. Extract <ACTION> block (Greedy)
-    action_match = re.search(r'<ACTION>(.*?)(?:</ACTION>|$)', text, re.DOTALL | re.IGNORECASE)
-    action_text = action_match.group(1).strip() if action_match else None
-
-    # 4. Fallback: If no tags, look for CALL: (legacy support)
-    if not action_text and not result["think"] and not result["report"]:
-        if "CALL:" in text:
-            call_split = text.split("CALL:", 1)
-            result["think"] = strip_all_tags(call_split[0])
-            action_text = "CALL:" + call_split[1]
-        else:
-            result["report"] = strip_all_tags(text)
-            return result
-
-    # 5. Parse the tool call
-    if action_text:
-        tool_name, args = _parse_tool_call(action_text)
-        if tool_name:
-            result["action"] = {"tool": tool_name, "args": args}
-        else:
-            # Action block exists but CALL: parsing failed
-            # Try to treat the action text as a report to avoid losing data, but strip tags!
-            result["report"] = strip_all_tags(action_text)
-    elif result["think"]:
-        # Has THINK but no ACTION/REPORT. Treat the rest of message as report.
-        remaining = text
-        if think_match:
-            remaining = text[think_match.end():].strip()
-        if remaining:
-            result["report"] = strip_all_tags(remaining)
+    # 3. Extract <ACTION> blocks (Multiple support)
+    action_matches = re.finditer(r'<ACTION>(.*?)(?:</ACTION>|$)', text, re.DOTALL | re.IGNORECASE)
+    actions = []
+    for match in action_matches:
+        action_text = match.group(1).strip()
+        if action_text:
+            tool_name, args = _parse_tool_call(action_text)
+            if tool_name:
+                actions.append({"tool": tool_name, "args": args})
     
-    # --- FINAL FALLBACK (No tags found or parsing failed) ---
-    if not result["action"] and not result["report"]:
-        print(f"WARNING: No structured tags found. Searching raw text for CALL: pattern...")
-        tool_name, args = _parse_tool_call(text)
-        if tool_name:
-            result["action"] = {"tool": tool_name, "args": args}
-        else:
-            # Absolute fallback: treat everything as a report
-            result["report"] = strip_all_tags(text)
+    if actions:
+        result["actions"] = actions
+        return result
+
+    # 4. Fallback: If no report/actions found via tags, capture untagged text or legacy CALL:
+    if not result["report"] and not result["actions"]:
+        # Remove THINK block to find untagged text
+        untagged_text = text
+        if think_match:
+            untagged_text = text[:think_match.start()] + text[think_match.end():]
+        
+        # Clean up remaining tags and whitespace
+        untagged_text = strip_all_tags(untagged_text)
+        
+        if "CALL:" in untagged_text:
+            call_split = untagged_text.split("CALL:", 1)
+            # Only set think if it wasn't already found via tags
+            if not result["think"]:
+                result["think"] = call_split[0].strip()
+            tool_name, args = _parse_tool_call("CALL:" + call_split[1])
+            if tool_name:
+                result["actions"] = [{"tool": tool_name, "args": args}]
+        elif untagged_text:
+            result["report"] = untagged_text
+        elif result.get("think"):
+            # Promotion fallback: if ONLY think exists, treat it as report
+            # This ensures we don't return an empty response to the user.
+            result["report"] = result["think"]
     
     return result
 
@@ -407,7 +372,14 @@ class LeanAgent:
         
         self.messages.append({"role": "user", "content": user_content})
 
+        loop_count = 0
         while True:
+            loop_count += 1
+            if loop_count > 25:
+                if callback:
+                    await callback({"type": "final_response", "content": "⚠️ Agent exceeded maximum internal loops. Forced stop to prevent infinite generation."})
+                return "Agent exceeded maximum turns."
+                
             # ── Build the messages payload for THIS API call ──────────────
             # 1. Fresh system prompt (always first, always current workspace)
             system_prompt = build_system_prompt(CURRENT_WORKSPACE)
@@ -438,99 +410,187 @@ class LeanAgent:
             self.messages.append(message)
 
             # ── Parse structured response ────────────────────────────────
-            tool_name = None
-            args = {}
+            actions = []
             think_text = None
             
             # Check for native function_call first (API-level tool use)
             if message.get("function_call"):
-                tool_name = message["function_call"]["name"]
                 try:
+                    tool_name = message["function_call"]["name"]
                     args = json.loads(message["function_call"]["arguments"])
+                    actions = [{"tool": tool_name, "args": args}]
                 except:
-                    args = {}
+                    pass
             else:
                 # Parse our structured format
                 parsed = parse_structured_response(content)
                 think_text = parsed["think"]
+                actions = parsed.get("actions") or []
                 
                 # Stream thinking to UI
                 if think_text and callback:
                     await callback({"type": "agent_thinking", "content": think_text})
                 
-                if parsed["action"]:
-                    tool_name = parsed["action"]["tool"]
-                    args = parsed["action"]["args"]
-                    
-                    # Truncate message content to prevent hallucinated tool results
-                    # (only keep up to the end of the <ACTION> block)
-                    action_end = re.search(r'</ACTION>', content)
-                    if action_end:
-                        truncated = content[:action_end.end()]
-                        for i in reversed(range(len(self.messages))):
-                            if self.messages[i] is message or (
-                                self.messages[i].get("role") == "assistant" 
-                                and self.messages[i].get("content") == content
-                            ):
-                                self.messages[i]["content"] = truncated
-                                break
-                
-                elif parsed["report"]:
-                    # Final response — send to UI and return
-                    if callback:
-                        await callback({"type": "final_response", "content": parsed["report"]})
-                    return parsed["report"]
-                else:
-                    # Empty/unparseable response — return raw content
-                    if callback:
-                        await callback({"type": "final_response", "content": content})
-                    return content
+                if not actions:
+                    if parsed.get("report"):
+                        # Final response — send to UI and return
+                        if callback:
+                            await callback({"type": "final_response", "content": parsed["report"]})
+                        return parsed["report"]
+                    else:
+                        # Empty/unparseable response — check for missing tags
+                        if "CALL:" in content or "open_browser" in content or "browser_goto" in content:
+                            error_msg = "⚠️ FORMATTING ERROR: Your response contained a tool name but was missing `<ACTION>` tags or had invalid JSON arguments. You MUST wrap your tool calls exactly like this:\n<ACTION>\nCALL: tool_name({\"arg\": \"val\"})\n</ACTION>\nPlease correct your response and try again."
+                            if callback:
+                                await callback({"type": "direct_terminal_result", "stdout": error_msg, "agent_controlled": True})
+                            self.messages.append({"role": "user", "content": error_msg})
+                            continue
+
+                        # If it's just raw text with no obvious tool intention, return it
+                        if callback:
+                            await callback({"type": "final_response", "content": content})
+                        return content
             
-            # ── Execute tool call ────────────────────────────────────────
-            if tool_name:
-                from tool_registry import requires_approval
-                
-                if requires_approval(tool_name, args):
+            # ── Execute tool calls ────────────────────────────────────────
+            if actions:
+                # Truncate message content to prevent hallucinated tool results
+                # (only keep up to the end of the last <ACTION> block)
+                action_matches = list(re.finditer(r'</ACTION>', content))
+                if action_matches:
+                    action_end = action_matches[-1]
+                    truncated = content[:action_end.end()]
+                    for i in reversed(range(len(self.messages))):
+                        msg_to_check = self.messages[i]
+                        if msg_to_check is message or (
+                            msg_to_check.get("role") == "assistant" 
+                            and msg_to_check.get("content") == content
+                        ):
+                            self.messages[i]["content"] = truncated
+                            break
+
+
+                # ── Smart batch execution: parallel for read-only, sequential for mutating ──
+                READ_ONLY_TOOLS = {
+                    "read_file", "grep_search", "find_files", "search_web",
+                    "git_diff", "recall_memory", "get_definition", "get_file_info",
+                    "get_file_tree", "list_files", "list_running_processes",
+                    "read_process_output", "read_url"
+                }
+
+                # Split actions into sequential groups, collecting read-only runs
+                async def _exec_one(t_name, t_args):
                     if callback:
-                        approval_data = {"type": "require_approval", "tool": tool_name, "args": args}
-                        if tool_name == "write_file":
-                            from tool_registry import get_diff
-                            path = args.get("path")
-                            file_content = args.get("content")
-                            if path and file_content:
+                        await callback({"type": "tool_start", "tool": t_name, "args": t_args})
+                    try:
+                        res = await handle_tool_call(t_name, t_args, callback)
+                    except Exception as e:
+                        import traceback; traceback.print_exc()
+                        res = {"error": f"Internal Tool Crash: {str(e)}"}
+                    if callback:
+                        await callback({"type": "tool_result", "tool": t_name, "result": res})
+                    return t_name, res
+
+                # Batch consecutive read-only tools; flush mutating tools immediately
+                pending_reads = []  # list of (name, args)
+
+                async def flush_reads():
+                    if not pending_reads:
+                        return
+                    if len(pending_reads) == 1:
+                        t_name, t_args = pending_reads[0]
+                        t_name, result = await _exec_one(t_name, t_args)
+                        _store_result(t_name, result)
+                    else:
+                        results = await asyncio.gather(*[_exec_one(n, a) for n, a in pending_reads])
+                        for t_name, result in results:
+                            _store_result(t_name, result)
+                    pending_reads.clear()
+
+                def _store_result(t_name, result):
+                    if isinstance(result, dict) and "base64_image" in result:
+                        b64 = result.pop("base64_image")
+                        self.messages.append({"role": "function", "name": t_name, "content": json.dumps(result)})
+                        self.messages.append({
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Screenshot result from browser:"},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                            ]
+                        })
+                    else:
+                        self.messages.append({"role": "function", "name": t_name, "content": json.dumps(result)})
+
+                for action_data in actions:
+                    t_name = action_data["tool"]
+                    t_args = action_data["args"]
+
+                    from tool_registry import requires_approval
+
+                    if requires_approval(t_name, t_args):
+                        # Flush any pending reads before approval flow
+                        await flush_reads()
+
+                        if callback:
+                            approval_data = {"type": "require_approval", "tool": t_name, "args": t_args}
+                            if t_name in ["write_file", "edit_file", "append_file"]:
+                                from tool_registry import get_diff, CURRENT_WORKSPACE
+                                import os
+                                path = t_args.get("path")
                                 try:
-                                    diff = get_diff(path, file_content)
-                                    approval_data["diff"] = diff
+                                    if t_name == "write_file":
+                                        file_content = t_args.get("content", "")
+                                        diff = get_diff(path, file_content)
+                                        approval_data["diff"] = diff
+                                    elif t_name == "edit_file":
+                                        target = t_args.get("target", "")
+                                        replacement = t_args.get("replacement", "")
+                                        full_path = os.path.isabs(path) and path or os.path.join(CURRENT_WORKSPACE, path)
+                                        if os.path.exists(full_path):
+                                            with open(full_path, 'r', encoding='utf-8') as f:
+                                                old_content = f.read()
+                                            if old_content.count(target) == 1:
+                                                simulated_new = old_content.replace(target, replacement, 1)
+                                                diff = get_diff(path, simulated_new)
+                                                approval_data["diff"] = diff
+                                            else:
+                                                approval_data["diff"] = f"--- (Validation Failed)\nTarget block count: {old_content.count(target)}. Must be exactly 1 to edit."
+                                        else:
+                                            approval_data["diff"] = f"--- (File not found: {path})\n"
                                 except Exception as de:
                                     print(f"⚠️ Diff generation failed: {de}")
-                                    approval_data["diff"] = "--- (Diff generation failed)\n+++ new content\n" + str(file_content)
-                            else:
-                                approval_data["diff"] = "--- (Insufficient data for diff)\n"
-                        await callback(approval_data)
-                    
-                    # Wait for user approval
-                    self.pending_approval = asyncio.get_event_loop().create_future()
-                    decision = await self.pending_approval
-                    self.pending_approval = None
-                    
-                    if not decision:
-                        result = {"error": "User denied permission for this tool call."}
+                                    approval_data["diff"] = "--- (Diff generation failed)\n" + str(de)
+                            await callback(approval_data)
+
+                        self.pending_approval = asyncio.get_event_loop().create_future()
+                        decision = await self.pending_approval
+                        self.pending_approval = None
+
+                        if not decision:
+                            result = {"error": "User denied permission for this tool call."}
+                            if callback:
+                                await callback({"type": "tool_result", "tool": t_name, "result": result})
+                            self.messages.append({"role": "function", "name": t_name, "content": json.dumps(result)})
+                            continue
+
+                        # Execute approved mutating tool immediately
+                        _, result = await _exec_one(t_name, t_args)
+                        _store_result(t_name, result)
+
+                    elif t_name in READ_ONLY_TOOLS:
+                        # Queue up for parallel execution
+                        pending_reads.append((t_name, t_args))
                     else:
-                        result = await handle_tool_call(tool_name, args, callback)
-                else:
-                    if callback:
-                        await callback({"type": "tool_start", "tool": tool_name, "args": args})
-                    result = await handle_tool_call(tool_name, args, callback)
+                        # Mutating but doesn't need approval – flush reads first, then execute
+                        await flush_reads()
+                        _, result = await _exec_one(t_name, t_args)
+                        _store_result(t_name, result)
+
+                # Flush any remaining reads at end of batch
+                await flush_reads()
+
                 
-                if callback:
-                    await callback({"type": "tool_result", "tool": tool_name, "result": result})
-                
-                self.messages.append({
-                    "role": "function",
-                    "name": tool_name,
-                    "content": json.dumps(result)
-                })
-                # Continue the loop for the agent to process the tool result
+                # Turn finished, continue loop to let agent see all results
+                continue
             else:
                 # Shouldn't reach here, but safety fallback
                 if callback:

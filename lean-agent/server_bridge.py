@@ -170,14 +170,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     agent_task.cancel()
                 agent_task = None
                 
-                # Kill any running subprocess
+                # Kill all running subprocesses
                 import tool_registry as _tr
-                if _tr.current_process and _tr.current_process.poll() is None:
-                    try:
-                        _tr.current_process.kill()
-                    except Exception:
-                        pass
-                _tr.current_process = None
+                for pid, info in list(_tr.active_processes.items()):
+                    process = info["process"]
+                    if process.poll() is None:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                _tr.active_processes.clear()
+                
+                if _tr.browser_manager:
+                    asyncio.create_task(_tr.browser_manager.close())
                 
                 # Resolve any pending approval so the agent doesn't ghost
                 if agent.pending_approval and not agent.pending_approval.done():
@@ -204,6 +209,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # ── Reset agent session ───────────────────────────────────────
             elif data.get("type") == "reset":
+                import tool_registry as _tr
+                for pid, info in list(_tr.active_processes.items()):
+                    if info["process"].poll() is None:
+                        try: info["process"].kill()
+                        except: pass
+                _tr.active_processes.clear()
+                if _tr.browser_manager:
+                    asyncio.create_task(_tr.browser_manager.close())
                 agent.reset()
                 session_id = None
                 current_deepseek_url = None
@@ -223,6 +236,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 folder_path = filedialog.askdirectory()
                 root.destroy()
                 if folder_path:
+                    import tool_registry as _tr
+                    for pid, info in list(_tr.active_processes.items()):
+                        if info["process"].poll() is None:
+                            try: info["process"].kill()
+                            except: pass
+                    _tr.active_processes.clear()
+                    if _tr.browser_manager:
+                        asyncio.create_task(_tr.browser_manager.close())
                     tool_registry.set_workspace(folder_path)
                     modified_files.clear()
                     session_id = None          # Fresh session for new workspace
@@ -284,7 +305,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     try:
                         import subprocess
                         result = subprocess.run(
-                            cmd, shell=True, capture_output=True, text=True,
+                            cmd, shell=True, capture_output=True, encoding='utf-8', errors='replace',
                             timeout=120, cwd=tool_registry.CURRENT_WORKSPACE
                         )
                         await websocket.send_json({
