@@ -1,184 +1,169 @@
+"""
+browser_manager.py – Async‑safe browser controller using a dedicated thread.
+Version 2.0 – added proper timeouts, error propagation, and clean shutdown.
+"""
+
+from __future__ import annotations
 import asyncio
-import threading
-import queue
 import base64
-import time
+import queue
+import threading
+import logging
+from typing import Any, Dict
+
+logger = logging.getLogger("browser_manager")
+
 
 class BrowserManager:
+    """Manages a Playwright browser instance in a dedicated thread with its own event loop."""
+
     def __init__(self):
-        self.cmd_queue = queue.Queue()
-        self.res_queue = queue.Queue()
-        self.thread = None
-        
-    def _log(self, msg):
-        try:
-            with open("browser.log", "a") as f:
-                f.write(msg + "\n")
-        except:
-            pass
+        self._cmd_queue: queue.Queue = queue.Queue()
+        self._res_queue: queue.Queue = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
+        self._shutdown = False
 
     def _start_worker_if_needed(self):
-        if self.thread is None or not self.thread.is_alive():
-            self.thread = threading.Thread(target=self._worker, daemon=True)
-            self.thread.start()
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._worker_thread, daemon=True)
+            self._thread.start()
 
-    def _worker(self):
-        self._log("[WORKER] Starting async thread")
-        # Create a dedicated event loop for this thread
+    def _worker_thread(self):
+        """Synchronous entry point – creates a fresh event loop for the thread."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self._async_worker())
-        except Exception as e:
-            self._log(f"[WORKER] Loop crashed: {str(e)}")
+        except Exception as exc:
+            logger.exception("Browser worker loop crashed: %s", exc)
         finally:
             loop.close()
 
     async def _async_worker(self):
         from playwright.async_api import async_playwright
-        self._log("[WORKER] Entering async_playwright")
         try:
             async with async_playwright() as p:
-                self._log("[WORKER] Playwright async initialized")
                 browser = await p.chromium.launch(headless=False)
-                self._log("[WORKER] Browser launched")
-                context = await browser.new_context(viewport={'width': 1280, 'height': 800})
+                context = await browser.new_context(viewport={"width": 1280, "height": 800})
                 page = await context.new_page()
-                self._log("[WORKER] Page ready")
-                
-                overlay_injected = False
-                
-                async def inject_overlay():
-                    nonlocal overlay_injected
-                    try:
-                        await page.evaluate("""() => {
-                            if (document.getElementById('zb-agent-overlay')) return;
-                            document.body.style.boxShadow = 'inset 0 0 0 5px rgba(0, 120, 255, 0.7)';
-                            const overlay = document.createElement('div');
-                            overlay.id = 'zb-agent-overlay';
-                            overlay.style.position = 'fixed'; overlay.style.top = '0'; overlay.style.left = '0';
-                            overlay.style.width = '100vw'; overlay.style.height = '100vh';
-                            overlay.style.backgroundColor = 'rgba(0, 0, 0, 0.3)';
-                            overlay.style.zIndex = '2147483647'; overlay.style.display = 'none';
-                            overlay.style.justifyContent = 'center'; overlay.style.alignItems = 'center';
-                            overlay.style.pointerEvents = 'all';
-                            const badge = document.createElement('div');
-                            badge.style.backgroundColor = 'rgba(255,0,0,0.9)'; badge.style.color = 'white';
-                            badge.style.padding = '15px 30px'; badge.style.borderRadius = '8px';
-                            badge.style.fontFamily = 'sans-serif'; badge.style.fontSize = '24px'; badge.style.fontWeight = 'bold';
-                            badge.innerText = '⚠️ Agent is controlling this page';
-                            overlay.appendChild(badge); document.body.appendChild(overlay);
-                        }""")
-                        overlay_injected = True
-                    except Exception:
-                        pass
+                self._inject_overlay(page)
 
-                async def set_blocking(is_blocked):
-                    if not overlay_injected: await inject_overlay()
-                    display = 'flex' if is_blocked else 'none'
+                while not self._shutdown:
+                    # Wait for a command with a timeout so we can check shutdown flag
                     try:
-                        await page.evaluate(f"() => {{ const el = document.getElementById('zb-agent-overlay'); if(el) el.style.display = '{display}'; }}")
-                    except Exception: pass
-                    
-                async def take_screenshot():
-                    await inject_overlay()
-                    await set_blocking(True)
-                    await page.wait_for_timeout(500)
-                    b = await page.screenshot(type='jpeg', quality=60)
-                    await set_blocking(False)
-                    return base64.b64encode(b).decode('utf-8')
+                        cmd, args = await asyncio.wait_for(
+                            asyncio.to_thread(self._cmd_queue.get), timeout=0.5
+                        )
+                    except asyncio.TimeoutError:
+                        continue
 
-                while True:
-                    self._log("[WORKER] Waiting for command (asyncio.to_thread)...")
-                    # Use a non-blocking poll or asyncio.to_thread so we don't block the event loop!
-                    cmd, args = await asyncio.to_thread(self.cmd_queue.get)
-                    self._log(f"[WORKER] Received cmd: {cmd}")
-                    
                     if cmd == "quit":
                         break
-                        
+
                     try:
-                        if cmd == "goto":
-                            url = args[0]
-                            if not url.startswith("http") and not url.startswith("file://"): url = "https://" + url
-                            self._log(f"[WORKER] Navigating to {url}")
-                            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                            self._log("[WORKER] Navigation complete, taking screenshot")
-                            overlay_injected = False
-                            b64 = await take_screenshot()
-                            self._log("[WORKER] Screenshot complete, putting to queue")
-                            self.res_queue.put({"status": "success", "url": page.url, "base64_image": b64})
-                            
-                        elif cmd == "click":
-                            await set_blocking(True)
-                            await page.click(args[0], timeout=5000, force=True)
-                            await page.wait_for_timeout(500)
-                            await set_blocking(False)
-                            self.res_queue.put({"status": "success", "message": f"Clicked {args[0]}", "base64_image": await take_screenshot()})
-                            
-                        elif cmd == "type":
-                            await set_blocking(True)
-                            await page.fill(args[0], args[1], timeout=5000, force=True)
-                            await page.wait_for_timeout(500)
-                            await set_blocking(False)
-                            self.res_queue.put({"status": "success", "message": f"Filled {args[0]} with '{args[1]}'", "base64_image": await take_screenshot()})
-                            
-                        elif cmd == "scroll":
-                            await set_blocking(True)
-                            amt = args[1]
-                            if args[0].lower() == "up": amt = -amt
-                            await page.mouse.wheel(0, amt)
-                            await page.wait_for_timeout(500)
-                            await set_blocking(False)
-                            self.res_queue.put({"status": "success", "message": f"Scrolled {args[0]} by {args[1]}px", "base64_image": await take_screenshot()})
-                            
-                        elif cmd == "screenshot":
-                            self.res_queue.put({"status": "success", "base64_image": await take_screenshot()})
-                            
+                        result = await self._handle_command(page, cmd, args)
+                        self._res_queue.put(result)
                     except Exception as e:
-                        self._log(f"[WORKER] Command error: {str(e)}")
-                        await set_blocking(False)
-                        self.res_queue.put({"error": str(e)})
-
-                self._log("[WORKER] Exiting naturally")
-                self.res_queue.put({"status": "success", "message": "Browser closed"})
-                
+                        logger.error("Command '%s' failed: %s", cmd, e)
+                        self._res_queue.put({"error": str(e)})
         except Exception as e:
-            self._log(f"[WORKER] CRASHED: {str(e)}")
-            while not self.cmd_queue.empty():
-                self.cmd_queue.get()
-            self.res_queue.put({"error": f"Browser engine crashed: {str(e)}"})
+            logger.exception("Browser engine crashed: %s", e)
+            # Drain command queue to unblock any waiting callers
+            while not self._cmd_queue.empty():
+                self._cmd_queue.get_nowait()
+            self._res_queue.put({"error": f"Browser engine crashed: {e}"})
+        finally:
+            self._res_queue.put({"status": "success", "message": "Browser closed"})
 
-    async def goto(self, url: str):
+    async def _handle_command(self, page, cmd: str, args: list) -> Dict[str, Any]:
+        if cmd == "goto":
+            url = args[0]
+            if not url.startswith("http") and not url.startswith("file://"):
+                url = "https://" + url
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            return await self._take_screenshot(page)
+
+        elif cmd == "click":
+            await page.click(args[0], timeout=5000, force=True)
+            await page.wait_for_timeout(500)
+            return await self._take_screenshot(page)
+
+        elif cmd == "type":
+            await page.fill(args[0], args[1], timeout=5000, force=True)
+            await page.wait_for_timeout(500)
+            return await self._take_screenshot(page)
+
+        elif cmd == "scroll":
+            direction, amount = args[0].lower(), args[1] if len(args) > 1 else 500
+            delta = -amount if direction == "up" else amount
+            await page.mouse.wheel(0, delta)
+            await page.wait_for_timeout(500)
+            return await self._take_screenshot(page)
+
+        elif cmd == "screenshot":
+            return await self._take_screenshot(page)
+
+        else:
+            return {"error": f"Unknown command: {cmd}"}
+
+    async def _inject_overlay(self, page):
+        """Ensure the controlling overlay is injected into the page."""
+        try:
+            await page.evaluate("""() => {
+                if (document.getElementById('zb-agent-overlay')) return;
+                const o = document.createElement('div');
+                o.id = 'zb-agent-overlay';
+                o.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.3);z-index:2147483647;display:none;justify-content:center;align-items:center;pointer-events:all;';
+                const b = document.createElement('div');
+                b.style.cssText = 'background:rgba(255,0,0,0.9);color:white;padding:15px 30px;border-radius:8px;font-family:sans-serif;font-size:24px;font-weight:bold;';
+                b.innerText = '⚠️ Agent controlling page';
+                o.appendChild(b);
+                document.body.appendChild(o);
+            }""")
+        except Exception:
+            pass
+
+    async def _take_screenshot(self, page) -> Dict[str, Any]:
+        """Capture screenshot with overlay shown temporarily."""
+        await page.evaluate("document.getElementById('zb-agent-overlay').style.display = 'flex'")
+        await page.wait_for_timeout(300)
+        b = await page.screenshot(type="jpeg", quality=60)
+        await page.evaluate("document.getElementById('zb-agent-overlay').style.display = 'none'")
+        return {"status": "success", "base64_image": base64.b64encode(b).decode()}
+
+    # Public async methods
+    async def goto(self, url: str) -> Dict[str, Any]:
         self._start_worker_if_needed()
-        self.cmd_queue.put(("goto", [url]))
-        return await asyncio.to_thread(self.res_queue.get)
+        self._cmd_queue.put(("goto", [url]))
+        return await asyncio.to_thread(self._res_queue.get)
 
-    async def click(self, selector: str):
+    async def click(self, selector: str) -> Dict[str, Any]:
         self._start_worker_if_needed()
-        self.cmd_queue.put(("click", [selector]))
-        return await asyncio.to_thread(self.res_queue.get)
+        self._cmd_queue.put(("click", [selector]))
+        return await asyncio.to_thread(self._res_queue.get)
 
-    async def type(self, selector: str, text: str):
+    async def type(self, selector: str, text: str) -> Dict[str, Any]:
         self._start_worker_if_needed()
-        self.cmd_queue.put(("type", [selector, text]))
-        return await asyncio.to_thread(self.res_queue.get)
+        self._cmd_queue.put(("type", [selector, text]))
+        return await asyncio.to_thread(self._res_queue.get)
 
-    async def scroll(self, direction: str, amount: int = 500):
+    async def scroll(self, direction: str, amount: int = 500) -> Dict[str, Any]:
         self._start_worker_if_needed()
-        self.cmd_queue.put(("scroll", [direction, amount]))
-        return await asyncio.to_thread(self.res_queue.get)
+        self._cmd_queue.put(("scroll", [direction, amount]))
+        return await asyncio.to_thread(self._res_queue.get)
 
-    async def screenshot(self):
+    async def screenshot(self) -> Dict[str, Any]:
         self._start_worker_if_needed()
-        self.cmd_queue.put(("screenshot", []))
-        return await asyncio.to_thread(self.res_queue.get)
+        self._cmd_queue.put(("screenshot", []))
+        return await asyncio.to_thread(self._res_queue.get)
 
-    async def close(self):
-        if self.thread and self.thread.is_alive():
-            self.cmd_queue.put(("quit", []))
-            return await asyncio.to_thread(self.res_queue.get)
+    async def close(self) -> Dict[str, Any]:
+        if self._thread and self._thread.is_alive():
+            self._shutdown = True
+            self._cmd_queue.put(("quit", []))
+            return await asyncio.to_thread(self._res_queue.get)
         return {"status": "success", "message": "Browser was not open"}
+
 
 # Global instance
 browser_manager = BrowserManager()

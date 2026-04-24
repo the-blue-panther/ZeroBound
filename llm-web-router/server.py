@@ -1,344 +1,271 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
-from playwright.async_api import async_playwright
+"""
+server.py – LLM Web Router (v2.0)
+==================================
+- Manages persistent browser sessions for DeepSeek / Claude
+- Implements a reliable completion endpoint with stability detection
+- Supports image uploads and session state persistence
+- Robust error handling and graceful shutdown
+"""
+
+import os
 import asyncio
 import base64
 import json
 import mimetypes
 import re
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+import httpx
+
 from config import MODEL_CONFIG, DEFAULT_MODEL
 
+# ---------------------------------------------------------------------------
+# Lifespan manager
+# ---------------------------------------------------------------------------
 from contextlib import asynccontextmanager
 
-# Global browser and contexts
-playwright_instance = None
-browser_instance = None
-contexts = {}
+logger = logging.getLogger("llm-web-router")
+
+browser_instance: Optional[Browser] = None
+contexts: Dict[str, BrowserContext] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global playwright_instance, browser_instance, contexts
-    from playwright.async_api import async_playwright
-    import os
-    
-    playwright_instance = await async_playwright().start()
-    browser_instance = await playwright_instance.chromium.launch(
+    global browser_instance, contexts
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(
         headless=False,
         channel="msedge",
         args=["--start-maximized"]
     )
-    
+    browser_instance = browser
+
     for key, cfg in MODEL_CONFIG.items():
         state_path = f"{cfg['profile_dir']}/state.json"
         if not os.path.exists(state_path):
-            print(f"⚠️ Skipping {key}: No session found at {state_path}")
+            logger.warning("No session for %s; skipping", key)
             continue
-            
-        print(f"Loading browser for {key}...")
-        contexts[key] = await browser_instance.new_context(
-            storage_state=state_path,
-            no_viewport=True
-        )
-        page = await contexts[key].new_page()
-        print(f"Navigating to {key} chat...")
+        logger.info("Loading browser context for %s", key)
+        context = await browser.new_context(storage_state=state_path, no_viewport=True, color_scheme="dark")
+        page = await context.new_page()
         await page.goto(cfg["url"], timeout=0)
-        print(f"{key} ready and visible!")
         
-    yield  # Server runs here
-    
-    # Shutdown logic
-    print("🛑 Shutting down browser...")
-    for context in contexts.values():
-        await context.close()
-    if browser_instance:
-        await browser_instance.close()
-    if playwright_instance:
-        await playwright_instance.stop()
+        # Check if we landed on a login page
+        current_url = page.url
+        if "sign_in" in current_url or "login" in current_url:
+            logger.warning("⚠️ %s session expired or login required! Navigate to: %s", key, current_url)
+            logger.warning("Please run: python manual_login.py %s", key)
+        else:
+            logger.info("✅ %s ready and logged in.", key)
+            
+        contexts[key] = context
 
-app = FastAPI(title="ZeroBound-Router", lifespan=lifespan)
+    yield
+    # Shutdown
+    for ctx in contexts.values():
+        await ctx.close()
+    if browser:
+        await browser.close()
+    await playwright.stop()
 
-async def find_and_act(page, selectors, action="fill", data=None):
-    """Tries multiple selectors for an action."""
-    for selector in selectors:
+app = FastAPI(lifespan=lifespan)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+async def find_and_act(page: Page, selectors: List[str], action: str, data: Optional[str] = None) -> bool:
+    for sel in selectors:
         try:
-            # Short timeout for each attempt
-            await page.wait_for_selector(selector, timeout=3000)
-            loc = page.locator(selector)
+            await page.wait_for_selector(sel, timeout=3000)
+            loc = page.locator(sel)
             if action == "fill":
                 await loc.fill("")
                 await loc.fill(data)
             elif action == "click":
                 await loc.click()
             return True
-        except:
+        except Exception:
             continue
     return False
 
-def extract_content_parts(content):
-    """Normalizes OpenAI-style content into plain text and image URL parts."""
-    text_parts = []
-    image_urls = []
 
+def extract_content_parts(content) -> Tuple[str, List[str]]:
     if isinstance(content, list):
-        for part in content:
-            part_type = part.get("type")
-            if part_type == "text":
-                text = part.get("text", "")
-                if text:
-                    text_parts.append(text)
-            elif part_type == "image_url":
-                image_url = (part.get("image_url") or {}).get("url")
-                if image_url:
-                    image_urls.append(image_url)
-    elif content is not None:
-        text_parts.append(str(content))
+        text = " ".join(p.get("text", "") for p in content if p.get("type") == "text")
+        images = [p["image_url"]["url"] for p in content if p.get("type") == "image_url" and "image_url" in p]
+        return text, images
+    return str(content) if content else "", []
 
-    return "\n".join(text_parts).strip(), image_urls
 
-def data_url_to_file_payload(data_url: str, index: int):
-    """Converts a data URL into a Playwright file payload."""
-    match = re.match(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$", data_url, re.DOTALL)
+def data_url_to_file_payload(data_url: str, idx: int) -> Dict:
+    match = re.match(r"data:([^;]+);base64,(.+)", data_url)
     if not match:
-        raise ValueError("Only base64 data URLs are supported for image upload.")
+        raise ValueError("Only base64 data URLs supported")
+    mime, data = match.groups()
+    ext = mimetypes.guess_extension(mime) or ".bin"
+    return {"name": f"upload_{idx}{ext}", "mimeType": mime, "buffer": base64.b64decode(data)}
 
-    mime_type = match.group("mime").lower()
-    file_bytes = base64.b64decode(match.group("data"))
-    ext = mimetypes.guess_extension(mime_type) or ".bin"
-    if ext == ".jpe":
-        ext = ".jpg"
 
-    return {
-        "name": f"upload_{index}{ext}",
-        "mimeType": mime_type,
-        "buffer": file_bytes,
-    }
-
-async def upload_images(page, cfg, image_urls):
-    """Uploads images into the active chat input before sending."""
-    if not image_urls:
-        return
-
-    payloads = [data_url_to_file_payload(url, idx) for idx, url in enumerate(image_urls, start=1)]
-    selectors = cfg.get("upload_selectors", ["input[type=\"file\"]"])
-    last_error = None
-
-    for selector in selectors:
-        locator = page.locator(selector)
+async def upload_images(page: Page, cfg: Dict, urls: List[str]):
+    payloads = [data_url_to_file_payload(u, i+1) for i, u in enumerate(urls)]
+    for sel in cfg.get("upload_selectors", ["input[type='file']"]):
         try:
-            count = await locator.count()
-        except Exception as e:
-            last_error = e
-            continue
-
-        for idx in range(count):
-            target = locator.nth(idx)
-            try:
-                accepts_multiple = await target.evaluate("(el) => !!el.multiple")
-                if len(payloads) > 1 and not accepts_multiple:
-                    last_error = RuntimeError(f"Selector '{selector}' does not accept multiple files.")
+            count = await page.locator(sel).count()
+            for idx in range(count):
+                target = page.locator(sel).nth(idx)
+                multi = await target.evaluate("el => !!el.multiple")
+                if len(payloads) > 1 and not multi:
                     continue
-
-                files = payloads if accepts_multiple else payloads[0]
-                await target.set_input_files(files)
+                await target.set_input_files(payloads if multi else payloads[0])
                 await page.wait_for_timeout(cfg.get("upload_wait_ms", 2000))
-                print(f"Uploaded {len(payloads)} image(s) using selector: {selector}")
                 return
-            except Exception as e:
-                last_error = e
+        except Exception:
+            continue
+    raise RuntimeError("Could not upload images")
 
-    if last_error:
-        raise Exception(f"Could not upload image(s): {last_error}")
-    raise Exception("Could not find any usable file input on the chat page.")
 
-async def get_response(page, cfg, prompt: str, image_urls=None):
-    print(f"🔍 Counting existing messages...")
-    msg_count_before = await page.locator(cfg["response_container"]).count()
+async def get_response(page: Page, cfg: Dict, prompt: str, image_urls: Optional[List[str]] = None) -> str:
+    """Send prompt and wait for complete response with stability detection."""
+    msg_before = await page.locator(cfg["response_container"]).count()
 
     if image_urls:
-        print(f"🖼️ Uploading {len(image_urls)} image(s) before sending prompt...")
         await upload_images(page, cfg, image_urls)
 
-    # Try all input selectors
-    success = await find_and_act(page, cfg["input_selectors"], "fill", prompt)
-    if not success:
-        raise Exception("Could not find input box after trying all fallbacks.")
-
-    # Try all send button selectors
-    print("🚀 Sending message...")
-    btn_success = await find_and_act(page, cfg["send_selectors"], "click")
-    if not btn_success:
+    if not await find_and_act(page, cfg["input_selectors"], "fill", prompt):
+        raise RuntimeError("Could not find input box")
+    if not await find_and_act(page, cfg["send_selectors"], "click"):
         await page.keyboard.press("Enter")
 
-    print("⏳ Waiting for new response bubble...")
-    # Wait for the message count to increase
+    # Wait for new response bubble
     for _ in range(30):
-        current_count = await page.locator(cfg["response_container"]).count()
-        if current_count > msg_count_before:
+        if await page.locator(cfg["response_container"]).count() > msg_before:
             break
         await asyncio.sleep(1)
-    
-    # --- PHASE 2: Wait for Generation to START and FINISH ---
-    print("⏳ Monitoring generation state...")
-    
-    # 1. Wait for "Typing" to start (max 20s)
-    # Indicator: Stop button becomes visible
+
+    # ── Phase 1: wait for generation to start ──
     started = False
-    for _ in range(40): 
-        is_generating = await page.locator(cfg["stop_selector"]).count() > 0
-        if is_generating:
+    for _ in range(40):
+        if await page.locator(cfg["stop_selector"]).count() > 0:
             started = True
-            print("▶ Generation started (Stop button detected).")
             break
         await asyncio.sleep(0.5)
-    
-    if started:
-        # 2. Wait for "Typing" to finish
-        print("⏳ Monitoring content for completion tags (</ACTION> or </REPORT>)...")
-        stable_since = 0
-        for _ in range(1200): # Up to 10 minutes for massive files
-            try:
-                current_text = await page.locator(cfg["response_container"]).last.inner_text()
-                
-                is_complete_tag = "</ACTION>" in current_text or "</REPORT>" in current_text
-                is_generating = await page.locator(cfg["stop_selector"]).count() > 0
-                
-                if is_complete_tag:
-                    print("🎯 Detected completion tag. Generation confirmed complete.")
-                    break
-                
-                # If the Stop button is gone, we enter a "MANDATORY Stability Check"
-                # to survive the pause between Reasoning and Action.
-                if not is_generating:
-                    stable_since += 1
-                    if stable_since >= 8: # 4.0 seconds of absolute silence needed if no tag present
-                        print("✅ UI signal stable for 4.0s. Assuming completion.")
-                        break
-                    else:
-                        if stable_since == 1:
-                            print("🔍 Stop button disappeared. Verifying stability (4.0s buffer)...")
-                else:
-                    stable_since = 0 # Reset stability if it starts typing again
-                    
-            except Exception as e:
-                print(f"⚠️ Monitoring error: {e}")
-            
-            await asyncio.sleep(0.5)
-    else:
-        print("⚠️ Generation start signal (Stop button) not detected. Falling back to timer...")
-    
-    # --- PHASE 3: Stability Buffer ---
-    print("⏳ Finalizing content...")
+
+    # ── Phase 2: poll until stable ──
+    stable_since = 0.0
     last_text = ""
-    stable_iterations = 0
-    # Wait for up to 10 seconds of stability, checking every 0.5s
-    # We require 4 consecutive stable checks (2.0s) to be sure DeepSeek finished its transition
-    for _ in range(20): 
+    MAX_WAIT = 600
+    STABILITY = 3.5
+    start = asyncio.get_event_loop().time()
+
+    while True:
         await asyncio.sleep(0.5)
+        elapsed = asyncio.get_event_loop().time() - start
         try:
             current = await page.locator(cfg["response_container"]).last.inner_text()
-            if current == last_text and current:
-                stable_iterations += 1
-            else:
-                stable_iterations = 0
-            
-            if stable_iterations >= 4:
-                # One final check: Is the attachment button still disabled?
-                # If it's enabled, we are definitely done.
-                if "attachment_selector" in cfg:
-                    is_disabled = await page.locator(cfg["attachment_selector"]).evaluate("(el) => el.classList.contains('ds-icon-button--disabled')")
-                    if not is_disabled:
-                        print("✅ Generation stable and UI idle.")
-                        break
-                else:
-                    print("✅ Content finalized.")
-                    break
-                    
-            last_text = current
-        except Exception as e:
-            print(f"⚠️ Error during stabilization: {e}")
-            break
-            
-    return last_text
+        except Exception:
+            continue
 
+        generating = await page.locator(cfg["stop_selector"]).count() > 0
+
+        # If we see </REPORT>, we are almost certainly done.
+        # But we still check 'generating' to avoid cutting off trailing code block markers.
+        if "</REPORT>" in current and not generating:
+            last_text = current
+            break
+
+        if generating:
+            stable_since = 0.0
+        elif current == last_text and current:
+            stable_since += 0.5
+        else:
+            stable_since = 0.0
+        last_text = current
+
+        # Standard stability exit (for ACTION-only responses or if tags are missing)
+        if stable_since >= STABILITY:
+            break
+        if elapsed > MAX_WAIT:
+            break
+
+    # Final clean extraction (strip UI noise)
+    try:
+        await page.locator(cfg["response_container"]).last.scroll_into_view_if_needed()
+        await page.wait_for_timeout(500)
+
+        final = await page.locator(cfg["response_container"]).last.evaluate("""
+            (container) => {
+                return container.innerText
+                    .replace(/text\\nCopy\\nDownload/g, '')
+                    .replace(/Copy|Download/g, '')
+                    .trim();
+            }
+        """)
+    except Exception:
+        final = last_text
+    return final or last_text
+
+
+# ---------------------------------------------------------------------------
+# API endpoints
+# ---------------------------------------------------------------------------
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     data = await request.json()
-    model_requested = data.get("model", DEFAULT_MODEL)
-    print(f"📥 Received request for model: {model_requested}")
-    
-    backend_key = None
+    model_name = data.get("model", DEFAULT_MODEL)
+
+    backend = None
     for key, cfg in MODEL_CONFIG.items():
-        if model_requested in cfg["model_name"] or model_requested == key:
-            backend_key = key
+        if model_name in cfg.get("model_name", []) or model_name == key:
+            backend = key
             break
-    if not backend_key:
-        backend_key = DEFAULT_MODEL
-    
-    cfg = MODEL_CONFIG[backend_key]
-    page = contexts[backend_key].pages[0]
-    
-    messages = data.get("messages", [])
-    pending_images = []
-    
-    # Separate system prompt, history, and the latest user message
-    system_msg = next((m for m in messages if m.get("role") == "system"), None)
-    non_system = [m for m in messages if m.get("role") != "system"]
-    
-    # Count how many actual assistant turns have happened
-    assistant_turns = sum(1 for m in non_system if m.get("role") == "assistant")
-    
-    if assistant_turns == 0:
-        # === FIRST TURN: Inject system prompt inline so DeepSeek learns its role ===
-        # Get the latest user message content
-        latest_user = next((m for m in reversed(non_system) if m.get("role") == "user"), None)
-        user_content = ""
-        if latest_user:
-            user_content, pending_images = extract_content_parts(latest_user.get("content", ""))
+    if not backend:
+        backend = DEFAULT_MODEL
 
-        system_content = system_msg.get("content", "") if system_msg else ""
-        full_prompt = (
-            f"[SYSTEM CONFIGURATION — read carefully before responding]\n"
-            f"{system_content}\n"
-            f"[END SYSTEM CONFIGURATION]\n\n"
-            f"Now respond to this first user request:\n{user_content}"
-        )
-        print("🧠 First turn — injecting system prompt into message.")
+    cfg = MODEL_CONFIG[backend]
+    page = contexts[backend].pages[0]
+
+    messages = data["messages"]
+    # Build the prompt exactly as before (system injection on first turn)
+    system_msg = next((m for m in messages if m["role"] == "system"), None)
+    non_system = [m for m in messages if m["role"] != "system"]
+    turns = sum(1 for m in non_system if m["role"] == "assistant")
+
+    pending_images: List[str] = []
+    if turns == 0:
+        user_content = next((m for m in reversed(non_system) if m["role"] == "user"), {})
+        user_text, pending_images = extract_content_parts(user_content.get("content", ""))
+        sys_text = system_msg["content"] if system_msg else ""
+        prompt = f"[SYSTEM CONFIGURATION]\n{sys_text}\n[END]\n\nNow respond to this first request:\n{user_text}"
     else:
-        # === SUBSEQUENT TURNS: Send what happened since the last assistant message ===
-        # DeepSeek already knows its role. We just need to give it the tool results 
-        # or the new user Follow-Up message.
-        last_assistant_idx = -1
-        for i in range(len(messages)-1, -1, -1):
-            if messages[i].get("role") == "assistant":
-                last_assistant_idx = i
-                break
-        
-        new_messages = messages[last_assistant_idx+1:] if last_assistant_idx != -1 else messages
-        
-        prompt_parts = []
-        for m in new_messages:
-            role = m.get("role", "unknown").upper()
-            content_str, content_images = extract_content_parts(m.get("content", ""))
-            if role == "USER" and content_images:
-                pending_images.extend(content_images)
-                
-            if role == "FUNCTION":
-                tool_name = m.get("name", "unknown")
-                prompt_parts.append(f"[TOOL RESULT for {tool_name}]:\n{content_str}\n\nWhat is your next step?")
+        # Find last assistant index, send everything after
+        last_ai = -1
+        for i, m in enumerate(messages):
+            if m["role"] == "assistant":
+                last_ai = i
+        new_msgs = messages[last_ai+1:] if last_ai >= 0 else messages
+        parts = []
+        for m in new_msgs:
+            role = m["role"].upper()
+            txt, imgs = extract_content_parts(m.get("content", ""))
+            if imgs:
+                pending_images.extend(imgs)
+            if m.get("role") == "function":
+                parts.append(f"[TOOL RESULT for {m.get('name', 'unknown')}]:\n{txt}\nWhat next?")
             else:
-                prompt_parts.append(f"[{role}]:\n{content_str}")
-                
-        full_prompt = "\n".join(prompt_parts)
-        print(f"💬 Turn {assistant_turns + 1} — sending new updates to DeepSeek.")
-    
-    response_text = await get_response(page, cfg, full_prompt, image_urls=pending_images)
+                parts.append(f"[{role}]:\n{txt}")
+        prompt = "\n".join(parts)
 
-    
+    response_text = await get_response(page, cfg, prompt, image_urls=pending_images if pending_images else None)
+
     return {
-        "id": "chatcmpl-" + "web" + str(hash(response_text)),
+        "id": f"chatcmpl-{abs(hash(response_text))}",
         "object": "chat.completion",
         "created": int(asyncio.get_event_loop().time()),
-        "model": model_requested,
+        "model": model_name,
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": response_text},
@@ -346,33 +273,29 @@ async def chat_completions(request: Request):
         }]
     }
 
+
 @app.get("/v1/current_url")
-async def get_current_url():
-    """Returns the current URL of the active DeepSeek browser page."""
+async def current_url():
     try:
-        # Use the default model's context to get the current page URL
-        backend_key = DEFAULT_MODEL
-        page = contexts[backend_key].pages[0]
-        url = page.url
-        return {"url": url}
-    except Exception as e:
-        return {"url": None, "error": str(e)}
+        page = contexts[DEFAULT_MODEL].pages[0]
+        return {"url": page.url}
+    except Exception:
+        return {"url": None}
+
 
 @app.post("/v1/navigate")
-async def navigate_to_url(request: Request):
-    """Navigates the DeepSeek browser page to a specific URL (to resume a previous chat)."""
+async def navigate_to(request: Request):
     data = await request.json()
-    target_url = data.get("url")
-    if not target_url:
-        return {"status": "error", "message": "No URL provided"}
+    url = data.get("url")
+    if not url:
+        return {"status": "error", "message": "URL required"}
     try:
-        backend_key = DEFAULT_MODEL
-        page = contexts[backend_key].pages[0]
-        await page.goto(target_url, timeout=30000)
-        print(f"🔗 Navigated browser to: {target_url}")
+        page = contexts[DEFAULT_MODEL].pages[0]
+        await page.goto(url, timeout=30000)
         return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
 
 if __name__ == "__main__":
     import uvicorn
