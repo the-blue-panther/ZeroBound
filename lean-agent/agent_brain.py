@@ -42,27 +42,32 @@ def normalize_display_path(path: str) -> str:
     if not path:
         return path
     
-    # Handle both Windows and Unix-style paths
-    if "\\s\\" in path.lower() or "/s/" in path.lower():
-        # Replace D:\s\ or D:/s/ with D:\Downloads\
-        clean = re.sub(r'([A-Za-z]:)[/\\\\]s[/\\\\]', r'\1:\\Downloads\\', path, flags=re.IGNORECASE)
-        # Also handle standalone s:\ or s:/ patterns
-        clean = re.sub(r'[/\\\\]s[/\\\\]', r'\\Downloads\\', clean, flags=re.IGNORECASE)
-        return clean
-    return path
+    # Normalize slashes first
+    norm = path.replace('/', '\\')
+    
+    # Robust replacement for D:\s\ junctions (Fixes the double-colon bug)
+    # Regex: Drive Letter + :, then \s, then optional slash
+    norm = re.sub(r'(?i)^([A-Za-z]:)\\s(\\)?', r'\1\\Downloads\\', norm)
+    
+    # Fix internal segments
+    norm = re.sub(r'(?i)\\s\\', r'\\Downloads\\', norm)
+    
+    # Final cleanup
+    while '\\\\' in norm:
+        norm = norm.replace('\\\\', '\\')
+    
+    return norm
 
 def normalize_conversation_paths(content: str) -> str:
     """Aggressively replace all ghost paths in conversation history."""
     if not content:
         return content
     
-    # Replace D:\s\ pattern (Windows)
-    content = re.sub(r'(?i)([A-Za-z]:)\\\\s\\\\', r'\1:\\Downloads\\', content)
-    content = re.sub(r'(?i)([A-Za-z]:)/s/', r'\1:/Downloads/', content)
+    # Fix occurrences of D:\s\ or D:/s/
+    content = re.sub(r'(?i)([A-Za-z]:)[/\\\\]s([/\\\\]|$)', r'\1\\Downloads\\', content)
     
-    # Replace standalone s:\ or s:/ patterns
-    content = re.sub(r'(?i)\\\\s\\\\', r'\\Downloads\\', content)
-    content = re.sub(r'(?i)/s/', r'/Downloads/', content)
+    # Fix intermediate segments like \s\
+    content = re.sub(r'(?i)[/\\\\]s[/\\\\]', r'\\Downloads\\', content)
     
     return content
 
@@ -87,22 +92,35 @@ def build_system_prompt(workspace: str) -> str:
         "2. **REPORT MODE**: Used when the task is complete or you have a final answer. Include <THINK> and <REPORT> blocks only. "
         "NEVER include an <ACTION> block in this mode.\n\n"
         "--- MODULAR BLOCK PROTOCOL ---\n"
-        "Use TRIPLE backticks for content blocks. Separate blocks with `---`.\n\n"
-        "[Example: ACTION MODE]\n"
-        f"<{TAG_THINK}>\n"
-        "I need to read the file to proceed.\n"
-        f"</{TAG_THINK}>\n"
-        "---\n"
-        f"<{TAG_ACTION}>\n"
-        "CALL: read_file({\"path\": \"example.py\"})\n"
-        f"</{TAG_ACTION}>\n\n"
+        "To ensure clean UI rendering and prevent Markdown loss, wrap your response inside <REPORT>. "
+        "1. Wrap narrative/text in ```markdown fragments. The UI will extract the raw text for clean rendering.\n"
+        "2. Wrap code in language-specific fragments (e.g., ```python). The UI will render these as standalone code blocks.\n"
+        "3. **CRITICAL**: NEVER nest triple-backticks. Terminate a ```markdown block COMPLETELY before starting a ```python block. "
+        "Use a symmetrical `---` separator between every single fragment.\n"
+        "4. Every block and separator must be on its own line with a blank line before it.\n\n"
         "[Example: REPORT MODE]\n"
         f"<{TAG_THINK}>\n"
-        "Task completed successfully.\n"
+        "Task completed. I'll summarize and show the code.\n"
         f"</{TAG_THINK}>\n"
         "---\n"
         f"<{TAG_REPORT}>\n"
-        "File has been created with the requested content.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "```markdown\n"
+        "# Solution Summary\n"
+        "I have created the module.\n"
+        "```\n"
+        "\n"
+        "---\n"
+        "\n"
+        "```python\n"
+        "def hello():\n"
+        "    print('world')\n"
+        "```\n"
+        "\n"
+        "---\n"
+        "\n"
         f"</{TAG_REPORT}>\n\n"
         "--- PROTOCOLS ---\n"
         "1. **FEEDBACK LOOP**: Treat tool execution like an RL agent. Do an action -> observe result -> then decide next step. "
@@ -111,6 +129,24 @@ def build_system_prompt(workspace: str) -> str:
         "After execution, analyze the ACTUAL result in the next turn.\n"
         "3. **WINDOWS PATH RESOLUTION**: Favor user-visible paths (e.g., `D:\\Downloads`) over resolved physical paths. "
         "The tools are now configured to preserve the path exactly as provided. If you see a path starting with `D:\\s\\`, it may be an internal mapping—STAY on the `D:\\Downloads` path unless forced otherwise.\n"
+        "4. **BATCH READ OPTIMIZATION**: To improve speed and context efficiency, use `read_files` (plural) to read multiple small/medium files in a single turn. You should dynamically decide which files to batch based on their size and relevance to your current task.\n"
+        "   - **FULL DOCUMENT SUPPORT**: You can now read and analyze: PDF, Word (.docx), PowerPoint (.pptx), Excel (.xlsx), CSV, Parquet, EPUB, and Images (PNG, JPG, TIFF).\n"
+        "   - **CONTEXT LIMITS**: You have a 128k token context window. Text files are served in 1000-line chunks. Use `start_line`/`end_line` for pagination of massive documents.\n"
+        "5. **CODE INDENTATION (CRITICAL)**: When writing or editing code, you MUST preserve indentation. To prevent spaces from being stripped during transmission, you MUST use the `lines_base64` or `target_lines_base64`/`replacement_lines_base64` parameters in file tools. Base64 encoding ensures 100% structural integrity of your code. NEVER flatten or strip indentation!\n"
+        "6. **WINDOWS SHELL BEST PRACTICES**: When using `run_command` or `start_background_command` on Windows:\n"
+        "   - Always wrap file paths in single or double quotes (e.g., `'D:\\Path with spaces\\file.txt'`) to handle spaces and special characters.\n"
+        "   - Favor relative paths starting with `.\\` (e.g., `.\\scripts\\run.bat`) to maintain portability.\n"
+        "   - The tools automatically handle the `cwd` (Current Working Directory), so you don't need to manually run `cd` or change drives (e.g., `D:`) unless specifically testing the shell environment.\n\n"
+        "--- TOOL SYNTAX (STRICT JSON) ---\n"
+        "Invoke tools EXACTLY like this inside <ACTION>:\n"
+        "```json\n"
+        "CALL: tool_name({\"arg\": \"val\"})\n"
+        "```\n\n"
+        "STRICT JSON RULES:\n"
+        "1. You MUST wrap the CALL: tool_name({...}) inside a ```json code block so whitespace is preserved.\n"
+        "2. Arguments MUST be a valid JSON object.\n"
+        "3. Use double quotes (\") for keys and values.\n"
+        "4. CRITICAL: For code/content where indentation matters, use the `lines_base64` array (base64-encoded lines) to strictly preserve all leading spaces and structural integrity!\n"
         f"{tools_desc}\n"
     )
 
@@ -425,16 +461,40 @@ class LeanAgent:
         await flush_reads()
 
     def _store_result(self, t_name, result):
-        if isinstance(result, dict) and "base64_image" in result:
-            b64 = result.pop("base64_image")
+        # Handle multimodal results (Images)
+        if isinstance(result, dict) and (result.get("is_image") or "base64_image" in result):
+            is_generic_image = result.get("is_image")
+            b64 = result.pop("content") if is_generic_image else result.pop("base64_image")
+            ext = result.get("ext", "jpeg")
+            
             self.messages.append({"role": "function", "name": t_name, "content": json.dumps(result)})
             self.messages.append({
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Screenshot result:"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                    {"type": "text", "text": f"Image content from {t_name}:"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/{ext};base64,{b64}"}}
                 ]
             })
+        # Handle batch read multimodal results
+        elif isinstance(result, dict) and t_name == "read_files" and "files" in result:
+            files = result["files"]
+            has_images = False
+            for path, content in files.items():
+                if isinstance(content, str) and content.startswith("IMAGE:"):
+                    has_images = True
+                    break
+            
+            self.messages.append({"role": "function", "name": t_name, "content": json.dumps(result)})
+            
+            if has_images:
+                image_contents = [{"type": "text", "text": "Images from batch read:"}]
+                for path, content in files.items():
+                    if isinstance(content, str) and content.startswith("IMAGE:"):
+                        b64 = content[6:]
+                        ext = path.split('.')[-1] if '.' in path else "jpeg"
+                        image_contents.append({"type": "image_url", "image_url": {"url": f"data:image/{ext};base64,{b64}"}})
+                
+                self.messages.append({"role": "user", "content": image_contents})
         else:
             self.messages.append({"role": "function", "name": t_name, "content": json.dumps(result)})
 

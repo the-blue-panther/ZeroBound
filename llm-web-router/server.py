@@ -198,10 +198,17 @@ async def get_response(page: Page, cfg: Dict, prompt: str, image_urls: Optional[
 
         final = await page.locator(cfg["response_container"]).last.evaluate("""
             (container) => {
-                return container.innerText
-                    .replace(/text\\nCopy\\nDownload/g, '')
-                    .replace(/Copy|Download/g, '')
-                    .trim();
+                // Force pre-wrap to prevent innerText from collapsing spaces
+                const oldStyle = container.style.whiteSpace;
+                container.style.whiteSpace = 'pre-wrap';
+                try {
+                    return container.innerText
+                        .replace(/text\\nCopy\\nDownload/g, '')
+                        .replace(/Copy|Download/g, '')
+                        .trim();
+                } finally {
+                    container.style.whiteSpace = oldStyle;
+                }
             }
         """)
     except Exception:

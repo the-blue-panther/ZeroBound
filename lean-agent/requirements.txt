@@ -5,3 +5,11 @@ python-dotenv
 requests
 colorama
 playwright
+pypdf
+pandas
+openpyxl
+python-docx
+python-pptx
+ebooklib
+pyarrow
+beautifulsoup4

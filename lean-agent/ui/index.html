@@ -1505,10 +1505,48 @@
             border-radius: 0 6px 6px 0;
         }
 
-        .md-body hr {
+        .md-body hr, .report-sep {
             border: none;
             border-top: 1px solid #252840;
             margin: 12px 0;
+        }
+
+        .report-sep {
+            border-top: 2px dashed #252840;
+            margin: 24px 0;
+        }
+
+        .raw-code-block {
+            background: #0d0e1a;
+            padding: 16px;
+            border-radius: 8px;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            color: #d1d1e0;
+            border-left: 4px solid #7c6ff7;
+            margin: 16px 0;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+
+        .report-container {
+            background: #0a0b14;
+            border: 1px solid #1e213a;
+            border-radius: 12px;
+            padding: 16px;
+            margin: 12px 0;
+            box-shadow: inset 0 0 20px rgba(0,0,0,0.3);
+        }
+
+        .report-code-block {
+            margin: 16px 0;
+            background: #0d0e1a;
+            border: 1px solid var(--border-bright);
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
         }
 
         /* KaTeX display-mode centering */
@@ -1829,6 +1867,66 @@
         }
 
         function renderMarkdown(text) {
+            if (typeof marked === 'undefined') return text || '';
+            
+            // 1. Strip XML-like tags if present
+            let cleanText = (text || '').replace(/<\/?REPORT>/gi, '').trim();
+
+            // 2. Detect Modular Block Protocol (Supports TRIPLE backtick fragments)
+            if (cleanText.includes('```')) {
+                const blockRegex = /(```+)(\w*)[^\n]*\n([\s\S]*?)\n?\1/g;
+                let lastIndex = 0;
+                let html = '<div class="report-container">';
+                let match;
+                let found = false;
+                
+                while ((match = blockRegex.exec(cleanText)) !== null) {
+                    found = true;
+                    // Content BEFORE the block (potentially the --- separator)
+                    const before = cleanText.substring(lastIndex, match.index).trim();
+                    if (before) {
+                        if (before === '---') {
+                            html += '<hr class="report-sep">';
+                        } else {
+                            html += renderMarkdownInternal(before);
+                        }
+                    }
+                    
+                    const [_, fence, lang, body] = match;
+                    if (lang === 'markdown') {
+                        // 1. Markdown Fragment: Render only the INNER content, stripping the 'markdown' header
+                        // Strip the literal word "markdown" if it appears at the very beginning of the body
+                        const cleanBody = body.replace(/^markdown\n?/i, '');
+                        html += renderMarkdownInternal(cleanBody);
+                    } else {
+                        // 2. Code Block: Show raw markdown source (with backticks)
+                        const fullBlock = `${fence}${lang}\n${body}\n${fence}`;
+                        // Escape HTML entities to prevent rendering as HTML
+                        const escapedBlock = escapeHtml(fullBlock);
+                        html += `<pre class="raw-code-block">${escapedBlock}</pre>`;
+                    }
+                    lastIndex = blockRegex.lastIndex;
+                }
+                
+                // Content AFTER all blocks
+                const after = cleanText.substring(lastIndex).trim();
+                if (after) {
+                    if (after === '---') {
+                        html += '<hr class="report-sep">';
+                    } else {
+                        html += renderMarkdownInternal(after);
+                    }
+                }
+                
+                html += '</div>';
+                if (found) return html;
+            }
+            
+            // Fallback for standard markdown
+            return renderMarkdownInternal(cleanText);
+        }
+
+        function renderMarkdownInternal(text) {
             if (typeof marked === 'undefined') return text || '';
 
             // STEP 1: Escape agent tags to prevent stripping

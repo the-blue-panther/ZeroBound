@@ -262,7 +262,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 agent.reset()
                 session_id = None
                 modified_files.clear()
-                await websocket.send_json({"type": "info", "content": "Agent session reset."})
+                
+                # Open a New Chat in DeepSeek UI
+                await navigate_deepseek_to("https://chat.deepseek.com/")
+                
+                await websocket.send_json({"type": "info", "content": "Agent session reset and DeepSeek set to New Chat."})
                 await broadcast_state()
 
             elif msg_type == "refresh_tree":
@@ -285,6 +289,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     modified_files.clear()
                     session_id = None
                     agent.reset()
+                    
+                    # Open a New Chat in DeepSeek UI
+                    await navigate_deepseek_to("https://chat.deepseek.com/")
+                    
                     await broadcast_state()
 
             elif msg_type == "load_history":

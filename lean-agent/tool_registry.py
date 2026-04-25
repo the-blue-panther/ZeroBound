@@ -48,10 +48,18 @@ def _get_initial_workspace() -> str:
     
     return candidate
 
-try:
-    CURRENT_WORKSPACE: str = _get_initial_workspace()
-except Exception:
-    CURRENT_WORKSPACE: str = os.getcwd()
+
+def _decode_base64(data: str) -> str:
+    """Decode base64 string to original text, preserving all whitespace."""
+    try:
+        return base64.b64decode(data).decode('utf-8')
+    except Exception as e:
+        return f"[Error decoding base64: {e}]"
+
+# ─── Path Mapping Globals ──────────────────────────────────────────────────
+CURRENT_WORKSPACE = os.getcwd()
+LOGICAL_ROOT = None
+PHYSICAL_ROOT = None
 
 _file_cache: Dict[str, Tuple[float, str]] = {}   # path → (mtime, text)
 
@@ -93,34 +101,146 @@ def _init_db():
 
 
 def sanitize_path(path: str) -> str:
-    """Forcibly maps internal physical paths back to user-visible Downloads paths."""
-    if not path:
+    """Dynamically maps physical paths back to logical paths based on current workspace."""
+    if not path or not isinstance(path, str):
         return path
-    norm = os.path.normpath(path)
-    # Handle D:\s\ style junction resolutions (case-insensitive)
-    if "\\s\\" in norm.lower() or "/s/" in norm.lower():
-        import re
-        # Try Downloads first (most common)
-        clean = re.sub(r'[/\\]s[/\\]', r'\\Downloads\\', norm, flags=re.IGNORECASE)
-        if os.path.exists(clean):
-            return clean
-        # Fallback: just replace in the string for display
-        return re.sub(r'[/\\]s[/\\]', r'\\Downloads\\', norm, flags=re.IGNORECASE)
+    
+    # Normalize to backslashes for consistent Windows processing
+    norm = path.replace('/', '\\')
+    
+    # Forced mapping for the known D:\s junction
+    if norm.lower().startswith("d:\\s"):
+        norm = "D:\\Downloads" + norm[4:]
+    
+    # If we have a known dynamic mapping, apply it
+    if LOGICAL_ROOT and PHYSICAL_ROOT:
+        if norm.lower().startswith(PHYSICAL_ROOT.lower()):
+            # Replace physical prefix with logical prefix
+            norm = LOGICAL_ROOT + norm[len(PHYSICAL_ROOT):]
+    
+    # Fallback/Safety: Only replace 's' with 'Downloads' if we are on D: 
+    # and it matches the known junction pattern. This prevents accidental 
+    # renaming in other projects.
+    if norm.lower().startswith("d:\\s\\"):
+        norm = "D:\\Downloads" + norm[4:]
+    
+    # Cleanup double slashes
+    while '\\\\' in norm:
+        norm = norm.replace('\\\\', '\\')
+    
     return norm
 
 
+def _get_operation_path(path: str) -> str:
+    """
+    Multi-stage path resolver to ensure 100% visibility on Windows.
+    1. Try logical path as provided.
+    2. Try Physical mapping (Downloads -> s).
+    3. Try Realpath (OS-level resolution).
+    4. Verify accessibility before returning.
+    """
+    if not path or not isinstance(path, str): return path
+    
+    # Absolute path logic
+    if os.path.isabs(path):
+        base = os.path.normpath(path)
+    else:
+        base = os.path.normpath(os.path.join(CURRENT_WORKSPACE, path))
+
+    candidates = [base]
+
+    # Stage 1: Add logical/physical mappings to candidates
+    if re.search(r'(?i)[/\\\\]downloads([/\\\\]|$)', base):
+        candidates.append(os.path.normpath(re.sub(r'(?i)[/\\\\]downloads([/\\\\]|$)', r'\\s\\', base)))
+    if re.search(r'(?i)[/\\\\]s([/\\\\]|$)', base):
+        candidates.append(os.path.normpath(re.sub(r'(?i)[/\\\\]s([/\\\\]|$)', r'\\Downloads\\', base)))
+    
+    # Stage 2: Add realpath resolution
+    try:
+        candidates.append(os.path.normpath(os.path.realpath(base)))
+    except:
+        pass
+
+    # Stage 3: Test candidates in order
+    def is_usable(p):
+        try:
+            if not os.path.exists(p): return False
+            if os.path.isdir(p):
+                os.listdir(p) # Verify listable
+            else:
+                # For files, just check if we can open for reading
+                with open(p, 'rb') as f:
+                    pass
+            return True
+        except:
+            return False
+
+    for cand in candidates:
+        if is_usable(cand):
+            return cand
+            
+    # Final Fallback: Return original normalized path
+    return base
+
+
+def diagnose_path(path: str) -> Dict[str, Any]:
+    """Provides deep diagnostic info about path visibility for debugging."""
+    if not path: return {"error": "No path provided"}
+    full = os.path.normpath(os.path.join(CURRENT_WORKSPACE, path)) if not os.path.isabs(path) else os.path.normpath(path)
+    
+    results = {
+        "input_path": path,
+        "absolute_normalized": full,
+        "exists": os.path.exists(full),
+        "is_dir": os.path.isdir(full) if os.path.exists(full) else None,
+        "realpath": os.path.realpath(full),
+        "working_path": _get_operation_path(path),
+        "current_workspace": CURRENT_WORKSPACE
+    }
+    
+    # Try shell visibility
+    try:
+        import subprocess
+        res = subprocess.run(f'dir "{full}"', shell=True, capture_output=True, text=True)
+        results["shell_visibility"] = "Visible" if res.returncode == 0 else f"Hidden (Code {res.returncode})"
+        if res.stdout:
+            results["shell_output_snippet"] = res.stdout[:500]
+    except Exception as e:
+        results["shell_error"] = str(e)
+        
+    return results
+
+
 def set_workspace(path: str) -> Dict[str, Any]:
-    global CURRENT_WORKSPACE
+    global CURRENT_WORKSPACE, LOGICAL_ROOT, PHYSICAL_ROOT
     
-    # Step 1: Normalize the path string (fix slashes, etc.) but DON'T resolve junctions
-    normalized_path = os.path.normpath(path)
+    # 1. Normalize and aggressively sanitize back to Downloads
+    norm = os.path.normpath(path).replace('/', '\\')
+    if norm.lower().startswith("d:\\s"):
+        norm = "D:\\Downloads" + norm[4:]
     
-    # Step 2: Check if the path exists WITHOUT resolving junctions
-    if os.path.exists(normalized_path):
-        # Store the EXACT path the user provided, not the resolved one
-        CURRENT_WORKSPACE = normalized_path
-        _init_db()
-        return {"status": "success", "workspace": CURRENT_WORKSPACE}
+    # 2. Check if logical exists, otherwise fallback to physical
+    if os.path.exists(norm):
+        CURRENT_WORKSPACE = norm
+    elif os.path.exists(path):
+        CURRENT_WORKSPACE = os.path.normpath(path)
+    else:
+        return {"error": f"Path not found: {path}"}
+        
+    # 3. Establish Junction Mappings for this session
+    if "downloads" in CURRENT_WORKSPACE.lower():
+        LOGICAL_ROOT = "D:\\Downloads"
+        PHYSICAL_ROOT = "D:\\s"
+    else:
+        LOGICAL_ROOT = CURRENT_WORKSPACE
+        PHYSICAL_ROOT = CURRENT_WORKSPACE
+        
+    _init_db()
+    return {
+        "status": "success", 
+        "workspace": CURRENT_WORKSPACE,
+        "mapping": f"{PHYSICAL_ROOT} -> {LOGICAL_ROOT}" if LOGICAL_ROOT != PHYSICAL_ROOT else "Direct"
+    }
     
     # Fallback: maybe the user provided a physical path? Try to map it back
     if "\\s\\" in normalized_path.lower():
@@ -167,16 +287,97 @@ def get_diff(path: str, new_content: str) -> str:
 # ---------------------------------------------------------------------------
 # File system tools
 # ---------------------------------------------------------------------------
-def read_file(path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> Dict[str, Any]:
-    full = os.path.isabs(path) and path or os.path.join(CURRENT_WORKSPACE, path)
-    if not os.path.exists(full):
-        return {"error": "File not found"}
-    ext = os.path.splitext(full)[1].lower()
-    IMAGE = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg"}
-    if ext in IMAGE:
+def _read_file_content(full: str, ext: str) -> Dict[str, Any]:
+    """Unified helper to extract content from various file types."""
+    # Image handling (Vision)
+    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg", ".tiff"}
+    if ext in IMAGE_EXTS:
         with open(full, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         return {"content": b64, "is_image": True, "ext": ext.lstrip(".")}
+
+    # PDF handling
+    if ext == ".pdf":
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(full)
+            text = "\n".join([page.extract_text() or "" for page in reader.pages])
+            return {"content": text, "is_pdf": True, "page_count": len(reader.pages)}
+        except Exception as e:
+            return {"error": f"PDF Error: {str(e)}"}
+
+    # Word Documents
+    if ext in {".docx", ".doc"}:
+        try:
+            import docx
+            doc = docx.Document(full)
+            text = "\n".join([p.text for p in doc.paragraphs])
+            return {"content": text, "is_doc": True}
+        except Exception as e:
+            return {"error": f"Word Error: {str(e)}"}
+
+    # PowerPoint
+    if ext in {".pptx", ".ppt"}:
+        try:
+            from pptx import Presentation
+            prs = Presentation(full)
+            text = ""
+            for i, slide in enumerate(prs.slides):
+                text += f"--- Slide {i+1} ---\n"
+                for shape in slide.shapes:
+                    if hasattr(shape, "text"):
+                        text += shape.text + "\n"
+            return {"content": text, "is_pptx": True}
+        except Exception as e:
+            return {"error": f"PowerPoint Error: {str(e)}"}
+
+    # EPUB
+    if ext == ".epub":
+        try:
+            import ebooklib
+            from ebooklib import epub
+            from bs4 import BeautifulSoup
+            book = epub.read_epub(full)
+            text = ""
+            for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+                text += BeautifulSoup(item.get_content(), 'html.parser').get_text() + "\n"
+            return {"content": text, "is_epub": True}
+        except Exception as e:
+            return {"error": f"EPUB Error: {str(e)}"}
+
+    # Data Files (Pandas)
+    if ext in {".xlsx", ".xls", ".csv", ".parquet"}:
+        try:
+            import pandas as pd
+            if ext == ".parquet":
+                df = pd.read_parquet(full)
+            elif ext in {".xlsx", ".xls"}:
+                df = pd.read_excel(full)
+            else:
+                df = pd.read_csv(full)
+            return {"content": df.to_csv(index=False), "is_data": True, "shape": df.shape}
+        except Exception as e:
+            if ext != ".csv": return {"error": f"Data Error: {str(e)}"}
+            
+    return {"is_text": True}
+
+
+def read_file(path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> Dict[str, Any]:
+    full = _get_operation_path(path)
+    if not os.path.exists(full):
+        return {"error": f"File not found: {path}"}
+    ext = os.path.splitext(full)[1].lower()
+    
+    # Try specialized extraction
+    special = _read_file_content(full, ext)
+    if "error" in special: return special
+    if not special.get("is_text"):
+        # For images, we need to add the path back for the agent_brain to use
+        if special.get("is_image"):
+            special["path"] = path
+        return special
+
+    # Plain Text Logic
 
     mtime = os.path.getmtime(full)
     if full in _file_cache and _file_cache[full][0] == mtime:
@@ -198,7 +399,7 @@ def read_file(path: str, start_line: Optional[int] = None, end_line: Optional[in
     total = len(lines)
     s = max(0, (start_line - 1) if start_line else 0)
     e = min(total, end_line if end_line else total)
-    MAX_LINES = 500
+    MAX_LINES = 1000
     note = ""
     if e - s > MAX_LINES:
         e = s + MAX_LINES
@@ -209,20 +410,115 @@ def read_file(path: str, start_line: Optional[int] = None, end_line: Optional[in
     return {"content": chunk, "range": [s+1, e], "total_lines": total, "note": note}
 
 
-def write_file(path: str, content: str) -> Dict[str, Any]:
-    full = os.path.isabs(path) and path or os.path.join(CURRENT_WORKSPACE, path)
+def read_files(paths: List[str]) -> Dict[str, Any]:
+    """
+    Read multiple small/medium files at once. 
+    Agent Brain dynamically decides which files to batch based on size.
+    """
+    if not isinstance(paths, list):
+        return {"error": "paths must be a list of strings"}
+    
+    results = {}
+    errors = {}
+    total_chars = 0
+    MAX_BATCH_CHARS = 100000 # ~100KB limit for the entire batch
+    MAX_SINGLE_FILE_CHARS = 30000 # Skip individual files larger than 30KB in batch mode
+    
+    for path in paths:
+        try:
+            full = _get_operation_path(path)
+            if not os.path.exists(full):
+                errors[path] = "Not found"
+                continue
+                
+            ext = os.path.splitext(full)[1].lower()
+            res = _read_file_content(full, ext)
+            
+            if "error" in res:
+                errors[path] = res["error"]
+                continue
+                
+            content = res.get("content", "")
+            
+            # Special handling for images in batch
+            if res.get("is_image"):
+                content = f"IMAGE:{content}"
+            elif res.get("is_text"):
+                # Load text content with encoding logic
+                # (We still need the encoding loop for unknown text files)
+                mtime = os.path.getmtime(full)
+                if full in _file_cache and _file_cache[full][0] == mtime:
+                    content = _file_cache[full][1]
+                else:
+                    for enc in ("utf-8-sig", "utf-8", "utf-16", "latin-1"):
+                        try:
+                            with open(full, "r", encoding=enc) as f:
+                                content = f.read()
+                            break
+                        except UnicodeError:
+                            continue
+                    else:
+                        with open(full, "rb") as f:
+                            content = f.read().decode("utf-8", errors="replace")
+                    _file_cache[full] = (mtime, content)
+            
+            if total_chars + len(content) > MAX_BATCH_CHARS:
+                errors[path] = "Batch capacity reached"
+                break
+                
+            results[path] = content
+            total_chars += len(content)
+            
+        except Exception as e:
+            errors[path] = str(e)
+            
+    return {
+        "files": results, 
+        "errors": errors if errors else None,
+        "note": f"Read {len(results)} files. Total size: {total_chars} chars."
+    }
+
+
+def write_file(path: str, content: str = "", lines: Optional[List[str]] = None,
+               content_base64: str = "", lines_base64: Optional[List[str]] = None) -> Dict[str, Any]:
+    if content_base64:
+        content = _decode_base64(content_base64)
+    elif lines_base64 is not None:
+        lines = [_decode_base64(l) for l in lines_base64]
+        content = "\n".join(lines)
+    elif lines is not None:
+        content = "\n".join(lines)
+    full = _get_operation_path(path)
     try:
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "w", encoding="utf-8") as f:
             f.write(content)
         _file_cache.pop(full, None)
-        return {"status": "success", "path": full}
+        return {"status": "success", "path": sanitize_path(full)}
     except Exception as e:
         return {"error": str(e)}
 
 
-def edit_file(path: str, target: str, replacement: str) -> Dict[str, Any]:
-    full = os.path.isabs(path) and path or os.path.join(CURRENT_WORKSPACE, path)
+def edit_file(path: str, target: str = "", replacement: str = "", 
+              target_lines: Optional[List[str]] = None, replacement_lines: Optional[List[str]] = None,
+              target_base64: str = "", replacement_base64: str = "",
+              target_lines_base64: Optional[List[str]] = None, replacement_lines_base64: Optional[List[str]] = None) -> Dict[str, Any]:
+    if target_base64:
+        target = _decode_base64(target_base64)
+    if replacement_base64:
+        replacement = _decode_base64(replacement_base64)
+    if target_lines_base64:
+        target_lines = [_decode_base64(l) for l in target_lines_base64]
+        target = "\n".join(target_lines)
+    if replacement_lines_base64:
+        replacement_lines = [_decode_base64(l) for l in replacement_lines_base64]
+        replacement = "\n".join(replacement_lines)
+        
+    if target_lines is not None:
+        target = "\n".join(target_lines)
+    if replacement_lines is not None:
+        replacement = "\n".join(replacement_lines)
+    full = _get_operation_path(path)
     if not os.path.exists(full):
         return {"error": f"File '{path}' not found"}
     with open(full, "r", encoding="utf-8") as f:
@@ -278,79 +574,103 @@ def edit_file(path: str, target: str, replacement: str) -> Dict[str, Any]:
     return {"error": "Target not found."}
 
 
-def append_file(path: str, content: str) -> Dict[str, Any]:
-    full = os.path.isabs(path) and path or os.path.join(CURRENT_WORKSPACE, path)
+def append_file(path: str, content: str = "", lines: Optional[List[str]] = None,
+                content_base64: str = "", lines_base64: Optional[List[str]] = None) -> Dict[str, Any]:
+    if content_base64:
+        content = _decode_base64(content_base64)
+    elif lines_base64 is not None:
+        lines = [_decode_base64(l) for l in lines_base64]
+        content = "\n".join(lines)
+    elif lines is not None:
+        content = "\n".join(lines)
+    full = _get_operation_path(path)
     try:
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "a", encoding="utf-8") as f:
             f.write(content)
-        return {"status": "success", "path": full}
+        return {"status": "success", "path": sanitize_path(full)}
     except Exception as e:
         return {"error": str(e)}
 
 
 def create_folder(path: str) -> Dict[str, Any]:
-    full = os.path.isabs(path) and path or os.path.join(CURRENT_WORKSPACE, path)
+    full = _get_operation_path(path)
     os.makedirs(full, exist_ok=True)
-    return {"status": "success", "path": full}
+    return {"status": "success", "path": sanitize_path(full)}
 
 
 def delete_file(path: str) -> Dict[str, Any]:
-    full = os.path.isabs(path) and path or os.path.join(CURRENT_WORKSPACE, path)
+    full = _get_operation_path(path)
     if not os.path.exists(full):
         return {"error": f"'{path}' not found"}
     if os.path.isdir(full):
         shutil.rmtree(full)
     else:
         os.remove(full)
-    return {"status": "success", "message": f"Deleted {path}"}
+    return {"status": "success", "path": sanitize_path(full)}
 
 
 def move_file(source: str, destination: str) -> Dict[str, Any]:
-    src = os.path.isabs(source) and source or os.path.join(CURRENT_WORKSPACE, source)
-    dst = os.path.isabs(destination) and destination or os.path.join(CURRENT_WORKSPACE, destination)
+    src = _get_operation_path(source)
+    dst = _get_operation_path(destination)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.move(src, dst)
-    return {"status": "success", "from": source, "to": destination}
+    return {"status": "success", "from": sanitize_path(src), "to": sanitize_path(dst)}
 
 
 def copy_file(source: str, destination: str) -> Dict[str, Any]:
-    src = os.path.isabs(source) and source or os.path.join(CURRENT_WORKSPACE, source)
-    dst = os.path.isabs(destination) and destination or os.path.join(CURRENT_WORKSPACE, destination)
+    src = _get_operation_path(source)
+    dst = _get_operation_path(destination)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     if os.path.isdir(src):
-        shutil.copytree(src, dst)
+        shutil.copytree(src, dst, dirs_exist_ok=True)
     else:
         shutil.copy2(src, dst)
-    return {"status": "success", "from": source, "to": destination}
+    return {"status": "success", "from": sanitize_path(src), "to": sanitize_path(dst)}
 
 
 def get_file_info(path: str) -> Dict[str, Any]:
-    full = os.path.isabs(path) and path or os.path.join(CURRENT_WORKSPACE, path)
+    full = _get_operation_path(path)
     if not os.path.exists(full):
         return {"error": f"'{path}' not found"}
     stat = os.stat(full)
+    logical_path = os.path.normpath(full)
+    physical_path = os.path.realpath(full)
     return {
         "path": path,
         "type": "folder" if os.path.isdir(full) else "file",
         "size_bytes": stat.st_size,
-        "modified_at": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat()
+        "modified_at": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        "resolved_physical_path": physical_path,
+        "is_logical_path": logical_path.lower() != physical_path.lower(),
+        "is_mapped": logical_path.lower() != physical_path.lower()
+    }
+
+
+def resolve_path(path: str) -> Dict[str, Any]:
+    full = _get_operation_path(path)
+    logical_path = sanitize_path(full)
+    physical_path = os.path.realpath(full)
+    return {
+        "logical_path": logical_path,
+        "physical_path": physical_path,
+        "is_mapped": logical_path.lower() != physical_path.lower()
     }
 
 
 def list_files(path: str = ".") -> Dict[str, Any]:
-    full = os.path.isabs(path) and path or os.path.join(CURRENT_WORKSPACE, path)
+    full = _get_operation_path(path)
     try:
-        return {"files": os.listdir(full), "path": full}
+        return {"files": os.listdir(full), "path": sanitize_path(full)}
     except Exception as e:
         return {"error": str(e)}
 
 
 def get_file_tree(startpath: Optional[str] = None) -> Any:
-    # Use normpath to preserve user-facing junction paths
+    # Use sanitized workspace for relative calculations
     if startpath is None:
         startpath = CURRENT_WORKSPACE
-    root = os.path.normpath(CURRENT_WORKSPACE)
+    root = sanitize_path(os.path.normpath(CURRENT_WORKSPACE))
     budget = {"remaining": MAX_TREE_NODES}
 
     def walk(p: str) -> Optional[Dict]:
@@ -360,8 +680,8 @@ def get_file_tree(startpath: Optional[str] = None) -> Any:
         if name in IGNORED_TREE_DIRS:
             return None
         
-        # Avoid abspath which resolves junctions
-        p_norm = os.path.normpath(p)
+        # Aggressively sanitize path to logical form before calculating relative path
+        p_norm = sanitize_path(p)
         rel = "." if p_norm == root else os.path.relpath(p_norm, root)
         
         node = {"name": name, "path": rel}
@@ -392,7 +712,7 @@ def get_file_tree(startpath: Optional[str] = None) -> Any:
 
 
 def grep_search(pattern: str, path: str = ".", case_insensitive: bool = True) -> Dict[str, Any]:
-    root = os.path.normpath(os.path.join(CURRENT_WORKSPACE, path))
+    root = _get_operation_path(path)
     flags = re.IGNORECASE if case_insensitive else 0
     try:
         regex = re.compile(pattern, flags)
@@ -410,7 +730,7 @@ def grep_search(pattern: str, path: str = ".", case_insensitive: bool = True) ->
                 with open(full, "r", encoding="utf-8", errors="ignore") as f:
                     for i, line in enumerate(f, 1):
                         if regex.search(line):
-                            results.append({"file": os.path.relpath(full, CURRENT_WORKSPACE), "line": i, "content": line.strip()})
+                            results.append({"file": os.path.relpath(sanitize_path(full), CURRENT_WORKSPACE), "line": i, "content": line.strip()})
                             if len(results) >= max_results:
                                 return {"results": results, "note": f"Capped at {max_results}"}
             except Exception:
@@ -422,11 +742,11 @@ def find_files(pattern: str) -> Dict[str, Any]:
     import fnmatch
     results = []
     max_results = 200
-    for dirpath, dirnames, filenames in os.walk(CURRENT_WORKSPACE):
+    for dirpath, dirnames, filenames in os.walk(_get_operation_path(".")):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_TREE_DIRS and d not in TRIMMED_TREE_DIRS]
         for fname in filenames:
             if fnmatch.fnmatch(fname, pattern) or pattern.lower() in fname.lower():
-                results.append(os.path.relpath(os.path.join(dirpath, fname), CURRENT_WORKSPACE))
+                results.append(os.path.relpath(sanitize_path(os.path.join(dirpath, fname)), CURRENT_WORKSPACE))
                 if len(results) >= max_results:
                     break
         if len(results) >= max_results:
@@ -435,7 +755,7 @@ def find_files(pattern: str) -> Dict[str, Any]:
 
 
 def reveal_in_os(path: str) -> Dict[str, Any]:
-    full = os.path.isabs(path) and path or os.path.join(CURRENT_WORKSPACE, path)
+    full = _get_operation_path(path)
     if not os.path.exists(full):
         return {"error": f"'{path}' not found"}
     if os.name == "nt":
@@ -660,7 +980,7 @@ def git_diff(path: Optional[str] = None) -> Dict[str, Any]:
     try:
         cmd = ["git", "diff"]
         if path:
-            full = os.path.isabs(path) and path or os.path.join(CURRENT_WORKSPACE, path)
+            full = _get_operation_path(path)
             cmd += ["--", full]
         p = subprocess.run(cmd, capture_output=True, text=True, cwd=CURRENT_WORKSPACE)
         return {"diff": p.stdout or "(No changes)", "stderr": p.stderr, "code": p.returncode}
@@ -709,6 +1029,7 @@ TOOL_MAP = {
     "edit_file": (edit_file, False),
     "append_file": (append_file, False),
     "read_file": (read_file, False),
+    "read_files": (read_files, False),
     "grep_search": (grep_search, False),
     "find_files": (find_files, False),
     "list_files": (list_files, False),
@@ -718,6 +1039,8 @@ TOOL_MAP = {
     "move_file": (move_file, False),
     "copy_file": (copy_file, False),
     "get_file_info": (get_file_info, False),
+    "resolve_path": (resolve_path, False),
+    "diagnose_path": (diagnose_path, False),
     "search_web": (search_web, True),
     "read_url": (read_url, True),
     "store_memory": (store_memory, False),
@@ -776,15 +1099,33 @@ TOOLS = [
         }
     },
     {
+        "name": "read_files",
+        "description": "Read multiple small/medium files at once. Best for batch inspection of codebases.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of file paths to read."
+                }
+            },
+            "required": ["paths"]
+        }
+    },
+    {
         "name": "write_file",
         "description": "Write or overwrite a file with new content.",
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Relative or absolute path."},
-                "content": {"type": "string", "description": "Full file content."}
+                "content": {"type": "string", "description": "Full file content."},
+                "content_base64": {"type": "string", "description": "Base64-encoded file content (preserves all whitespace)."},
+                "lines": {"type": "array", "items": {"type": "string"}, "description": "Alternative to content: Provide file content as an array of lines."},
+                "lines_base64": {"type": "array", "items": {"type": "string"}, "description": "Alternative to content: array of base64 lines."}
             },
-            "required": ["path", "content"]
+            "required": ["path"]
         }
     },
     {
@@ -795,9 +1136,15 @@ TOOLS = [
             "properties": {
                 "path": {"type": "string", "description": "Path to the file."},
                 "target": {"type": "string", "description": "The exact string to be replaced."},
-                "replacement": {"type": "string", "description": "The new content."}
+                "replacement": {"type": "string", "description": "The new content."},
+                "target_base64": {"type": "string", "description": "Base64-encoded target."},
+                "replacement_base64": {"type": "string", "description": "Base64-encoded replacement."},
+                "target_lines": {"type": "array", "items": {"type": "string"}, "description": "Alternative to target: array of lines."},
+                "replacement_lines": {"type": "array", "items": {"type": "string"}, "description": "Alternative to replacement: array of lines."},
+                "target_lines_base64": {"type": "array", "items": {"type": "string"}, "description": "Alternative to target: array of base64 lines."},
+                "replacement_lines_base64": {"type": "array", "items": {"type": "string"}, "description": "Alternative to replacement: array of base64 lines."}
             },
-            "required": ["path", "target", "replacement"]
+            "required": ["path"]
         }
     },
     {
@@ -807,9 +1154,12 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "content": {"type": "string"}
+                "content": {"type": "string"},
+                "content_base64": {"type": "string", "description": "Base64-encoded content."},
+                "lines": {"type": "array", "items": {"type": "string"}, "description": "Alternative to content: array of lines."},
+                "lines_base64": {"type": "array", "items": {"type": "string"}, "description": "Alternative to content: array of base64 lines."}
             },
-            "required": ["path", "content"]
+            "required": ["path"]
         }
     },
     {
@@ -855,6 +1205,15 @@ TOOLS = [
         }
     },
     {
+        "name": "diagnose_path",
+        "description": "Provide deep diagnostic info about path visibility for debugging.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }
+    },
+    {
         "name": "list_files",
         "description": "List files in a directory.",
         "parameters": {
@@ -876,6 +1235,17 @@ TOOLS = [
         "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "resolve_path",
+        "description": "Resolve a logical path to its actual physical filesystem path, accounting for any internal mappings.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "The path to resolve (e.g., '.', './folder', 'D:\\Downloads\\...')."}
+            },
             "required": ["path"]
         }
     },

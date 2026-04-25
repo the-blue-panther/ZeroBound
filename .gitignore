@@ -39,3 +39,12 @@ thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Databases
+*.db
+lean-agent/*.db
+
+# Agent Scratchpad
+scratch/
+lean-agent/scratch/
+Future Planned Features/
