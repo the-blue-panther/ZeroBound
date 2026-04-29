@@ -108,9 +108,9 @@ PHYSICAL_ROOT = None
 
 _file_cache: Dict[str, Tuple[float, str]] = {}   # path → (mtime, text)
 
-IGNORED_TREE_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
-TRIMMED_TREE_DIRS = {"venv", ".venv", "node_modules", "dist", "build", "target"}
-MAX_TREE_NODES = 2500
+IGNORED_TREE_DIRS = set()
+TRIMMED_TREE_DIRS = set()
+MAX_TREE_NODES = 10000
 
 SAFE_COMMANDS = {
     "dir", "ls", "pwd", "echo", "git status", "git log",

@@ -676,6 +676,7 @@
                 <div class="explorer-header">
                     <span class="panel-title">Files</span>
                     <div class="explorer-actions">
+                        <button class="icon-btn" onclick="expandAllFolders()" title="Expand All Folders">⊞</button>
                         <button class="icon-btn" onclick="collapseAllFolders()" title="Collapse All Folders">⊟</button>
                         <button class="icon-btn" onclick="refreshTree()" title="Refresh">↺</button>
                     </div>
@@ -1432,6 +1433,13 @@
             document.querySelectorAll('.tree-children').forEach(el => el.classList.add('collapsed'));
             document.querySelectorAll('.folder-arrow').forEach(el => el.textContent = '▶');
         }
+        function expandAllFolders() {
+            document.querySelectorAll('.tree-children').forEach(el => {
+                el.classList.remove('collapsed');
+                el.style.maxHeight = '9999px';
+            });
+            document.querySelectorAll('.folder-arrow').forEach(el => el.textContent = '▼');
+        }
         function refreshTree() { ws.send(JSON.stringify({ type: 'refresh_tree' })); }
 
         function renderTree(node) {
@@ -1442,8 +1450,9 @@
                     const wrapper = document.createElement('div');
                     const header = document.createElement('div'); header.className = 'tree-item tree-folder';
                     header.style.paddingLeft = (10 + depth * 14) + 'px';
-                    header.innerHTML = `<span class="folder-arrow" style="font-size:10px;transition:.2s">▶</span><span>📂</span><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${n.name}</span>`;
-                    const children = document.createElement('div'); children.className = 'tree-children collapsed';
+                    header.innerHTML = `<span class="folder-arrow" style="font-size:10px;transition:.2s">▼</span><span>📂</span><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${n.name}</span>`;
+                    const children = document.createElement('div'); children.className = 'tree-children';
+                    children.style.maxHeight = '9999px';
                     header.onclick = (e) => {
                         e.stopPropagation();
                         const collapsed = children.classList.toggle('collapsed');

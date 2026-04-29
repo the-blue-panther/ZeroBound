@@ -215,9 +215,7 @@ def parse_structured_response(text: str):
     for match in action_matches:
         action_text = match.group(1).strip()
         if action_text:
-            tool_name, args = _parse_tool_call(action_text)
-            if tool_name:
-                actions.append({"tool": tool_name, "args": args})
+            actions.extend(_parse_tool_call(action_text))
     if actions:
         result["actions"] = actions
 
@@ -225,70 +223,75 @@ def parse_structured_response(text: str):
     if not result["report"] and not result["actions"]:
         untagged_text = strip_all_tags(text)
         if "CALL:" in untagged_text:
-            call_split = untagged_text.split("CALL:", 1)
-            if not result["think"]:
-                result["think"] = call_split[0].strip()
-            tool_name, args = _parse_tool_call("CALL:" + call_split[1])
-            if tool_name:
-                result["actions"] = [{"tool": tool_name, "args": args}]
+            call_idx = untagged_text.find("CALL:")
+            if not result["think"] and call_idx > 0:
+                result["think"] = untagged_text[:call_idx].strip()
+            result["actions"] = _parse_tool_call(untagged_text)
         elif untagged_text:
             result["report"] = untagged_text
     return result
 
-def _parse_tool_call(text: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Extract tool_name and arguments from CALL: tool({...}) format."""
-    if not text: return None, {}
+def _extract_raw_content(text: str) -> str:
+    """Extract content from backticked blocks or naked text."""
+    if not text: return ""
+    block_match = re.search(r'^(`{3,})[a-zA-Z0-9_]*\n(.*)\1$', text, re.DOTALL | re.IGNORECASE)
+    if block_match: return block_match.group(2).strip()
+    match_open = re.search(r'^(`{3,})[a-zA-Z0-9_]*\n', text)
+    if match_open:
+        ticks = match_open.group(1)
+        content = text[match_open.end():].strip()
+        if content.endswith(ticks): content = content[:-len(ticks)].strip()
+        return content
+    return text
+
+def _tool_supports_param(tool_name: str, param: str) -> bool:
+    """Check if a tool supports a specific parameter."""
+    for t in TOOLS:
+        if t["name"] == tool_name:
+            return param in t.get("parameters", {}).get("properties", {})
+    return False
+
+def _parse_tool_call(text: str) -> List[Dict[str, Any]]:
+    """Extract ALL tool calls from a block of text, supporting RAW BLOCK content."""
+    if not text: return []
+    actions = []
+    starts = [m.start() for m in re.finditer(r'CALL:\s*\w+\s*\(', text, re.IGNORECASE)]
     
-    tool_name, args, end_idx = None, {}, -1
-    
-    match = re.search(r'CALL:\s*(\w+)\s*\(\s*(\{.*?\})\s*\)', text, re.DOTALL | re.IGNORECASE)
-    if match:
-        tool_name, json_str = match.group(1), match.group(2)
-        end_idx = match.end()
-        try: args = json.loads(json_str)
-        except json.JSONDecodeError:
-            fixed = _fix_json_string(json_str)
-            try: args = json.loads(fixed)
-            except:
-                recovered = _recover_truncated_json(json_str)
-                try: args = json.loads(recovered)
-                except: pass
-    else:
-        tool_name, args, end_idx = _manual_brace_parse(text)
+    for i, start_pos in enumerate(starts):
+        end_boundary = starts[i+1] if i+1 < len(starts) else len(text)
+        chunk = text[start_pos:end_boundary]
         
-    if tool_name and end_idx != -1:
-        remaining = text[end_idx:]
-        
-        # 1. Strip the closing backticks of the CALL block if they immediately follow
-        remaining = re.sub(r'^\s*```\s*\n', '', remaining)
-        remaining = remaining.strip()
-        
-        if remaining:
-            # 2. Check if perfectly wrapped in a single markdown block (supports 3 or 4 backticks)
-            block_match = re.search(r'^(`{3,})[a-zA-Z0-9_]*\n(.*)\1$', remaining, re.DOTALL | re.IGNORECASE)
-            if block_match:
-                args["content"] = block_match.group(2).strip()
-            else:
-                # 3. Handle missing closing backtick or naked content
-                match_open = re.search(r'^(`{3,})[a-zA-Z0-9_]*\n', remaining)
-                if match_open:
-                    ticks = match_open.group(1)
-                    remaining = remaining[match_open.end():].strip()
-                    if remaining.endswith(ticks):
-                        remaining = remaining[:-len(ticks)].strip()
-                args["content"] = remaining
+        tool_name, args, call_end = None, {}, -1
+        match = re.search(r'CALL:\s*(\w+)\s*\(\s*(\{.*?\})\s*\)', chunk, re.DOTALL | re.IGNORECASE)
+        if match:
+            tool_name, json_str = match.group(1), match.group(2)
+            call_end = match.end()
+            try: args = json.loads(json_str)
+            except json.JSONDecodeError:
+                fixed = _fix_json_string(json_str)
+                try: args = json.loads(fixed)
+                except:
+                    recovered = _recover_truncated_json(json_str)
+                    try: args = json.loads(recovered)
+                    except: pass
+        else:
+            tool_name, args, call_end = _manual_brace_parse(chunk)
             
-            # 4. Unescape double-backslashes that LLMs produce in raw block mode
-            # LLMs apply JSON escaping conventions (\\) even in raw blocks
-            # We convert \\cmd → \cmd so LaTeX/Obsidian renders correctly
-            if "content" in args and args["content"]:
-                raw = args["content"]
-                # Only unescape \\X sequences → \X (where X is not 'n', 't' etc that have meaning)
-                # We use a regex to replace \\ with \ but preserve \n and \t as real chars
-                raw = re.sub(r'\\\\', r'\\', raw)
-                args["content"] = raw
+        if tool_name and call_end != -1:
+            remaining = chunk[call_end:].strip()
+            remaining = re.sub(r'^\s*```\s*\n', '', remaining).strip()
             
-    return tool_name, args
+            if remaining:
+                supp_c = _tool_supports_param(tool_name, "content")
+                supp_r = _tool_supports_param(tool_name, "replacement")
+                if supp_c or supp_r:
+                    content = _extract_raw_content(remaining)
+                    if content:
+                        content = re.sub(r'\\\\', r'\\', content)
+                        if supp_c: args["content"] = content
+                        elif supp_r: args["replacement"] = content
+            actions.append({"tool": tool_name, "args": args})
+    return actions
 
 def _fix_json_string(json_str: str) -> str:
     # 1. Fix single backslashes (like Windows paths) that break JSON parsing
@@ -344,7 +347,9 @@ def _manual_brace_parse(text: str) -> Tuple[Optional[str], Dict[str, Any], int]:
                 opened -= 1
                 if opened == 0:
                     json_str = args_raw[brace_start:i+1]
-                    end_idx = match.start(2) + i + 1
+                    # Find the closing parenthesis for the CALL: function(args)
+                    next_paren = args_raw.find(')', i + 1)
+                    end_idx = match.start(2) + (next_paren + 1 if next_paren != -1 else i + 1)
                     try: return tool_name, json.loads(_fix_json_string(json_str)), end_idx
                     except: return tool_name, {}, end_idx
     return tool_name, {}, -1
