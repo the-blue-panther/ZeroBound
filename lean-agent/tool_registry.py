@@ -25,6 +25,52 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus as url_quote
 
 import httpx
+import platform
+from pathlib import Path
+import urllib.request
+import urllib.parse
+from urllib.error import URLError, HTTPError
+import zipfile
+import tarfile
+import time
+import hashlib
+
+# Try to import optional dependencies for extended tools
+HAVE_PSUTIL = False
+HAVE_GIT = False
+HAVE_PANDAS = False
+HAVE_MATPLOTLIB = False
+HAVE_JEDI = False
+
+try:
+    import psutil
+    HAVE_PSUTIL = True
+except ImportError:
+    pass
+
+try:
+    import git
+    HAVE_GIT = True
+except ImportError:
+    pass
+
+try:
+    import pandas as pd
+    HAVE_PANDAS = True
+except ImportError:
+    pass
+
+try:
+    import matplotlib.pyplot as plt
+    HAVE_MATPLOTLIB = True
+except ImportError:
+    pass
+
+try:
+    import jedi
+    HAVE_JEDI = True
+except ImportError:
+    pass
 
 # ---------------------------------------------------------------------------
 # Globals & workspace
@@ -40,9 +86,8 @@ def _get_initial_workspace() -> str:
     candidate = os.path.normpath(parent_dir)
     
     # Check if this looks like a physical path that should be user-facing
-    if "\\s\\" in candidate.lower():
-        import re
-        user_path = re.sub(r'\\s\\', r'\\Downloads\\', candidate, flags=re.IGNORECASE)
+    if re.search(r'(?i)[/\\\\]s([/\\\\]|$)', candidate):
+        user_path = os.path.normpath(re.sub(r'(?i)([/\\\\])s([/\\\\]|$)', r'\1Downloads\2', candidate))
         if os.path.exists(user_path):
             return user_path
     
@@ -100,29 +145,49 @@ def _init_db():
     conn.close()
 
 
+def resolve_workspace_path(path: str) -> str:
+    """
+    Convert any workspace path (including kernel/physical paths) to its user-visible logical form.
+    Handles Windows folder redirection (e.g., Downloads moved from C: to D:).
+    """
+    if not path: return path
+    
+    # 1. Basic normalization
+    norm = os.path.normpath(path).replace('/', '\\')
+    
+    # 2. Known folder mapping
+    # (USERPROFILE mapping removed as static s->Downloads is preferred for this environment)
+    
+    # 3. Handle common kernel/physical artifacts (like \s\ or \??\ or device paths)
+    # Specifically for the D:\s case mentioned by the user
+    if '\\s\\' in norm.lower() or norm.lower().startswith('d:\\s'):
+        # Map physical 's' back to 'Downloads'
+        logical = norm.replace('\\s\\', '\\Downloads\\').replace('d:\\s', 'd:\\Downloads')
+        if os.path.exists(logical):
+            return logical
+
+    # 4. Handle redirected 'Downloads' specifically
+    # The static mapping above covers the most common cases. 
+    # Segment-based logical mapping is handled by dynamic LOGICAL_ROOT mapping in sanitize_path.
+    return norm
+
+
 def sanitize_path(path: str) -> str:
     """Dynamically maps physical paths back to logical paths based on current workspace."""
     if not path or not isinstance(path, str):
         return path
     
-    # Normalize to backslashes for consistent Windows processing
-    norm = path.replace('/', '\\')
+    # 1. Use the new resolve_workspace_path for canonicalization
+    norm = resolve_workspace_path(path)
     
-    # Forced mapping for the known D:\s junction
-    if norm.lower().startswith("d:\\s"):
-        norm = "D:\\Downloads" + norm[4:]
-    
-    # If we have a known dynamic mapping, apply it
+    # 2. Apply Dynamic Workspace Mappings (LOGICAL_ROOT/PHYSICAL_ROOT)
     if LOGICAL_ROOT and PHYSICAL_ROOT:
-        if norm.lower().startswith(PHYSICAL_ROOT.lower()):
+        # Normalize for comparison
+        n_norm = norm.lower()
+        p_norm = PHYSICAL_ROOT.lower()
+        if n_norm.startswith(p_norm):
             # Replace physical prefix with logical prefix
             norm = LOGICAL_ROOT + norm[len(PHYSICAL_ROOT):]
-    
-    # Fallback/Safety: Only replace 's' with 'Downloads' if we are on D: 
-    # and it matches the known junction pattern. This prevents accidental 
-    # renaming in other projects.
-    if norm.lower().startswith("d:\\s\\"):
-        norm = "D:\\Downloads" + norm[4:]
     
     # Cleanup double slashes
     while '\\\\' in norm:
@@ -133,44 +198,54 @@ def sanitize_path(path: str) -> str:
 
 def _get_operation_path(path: str) -> str:
     """
-    Multi-stage path resolver to ensure 100% visibility on Windows.
-    1. Try logical path as provided.
-    2. Try Physical mapping (Downloads -> s).
-    3. Try Realpath (OS-level resolution).
-    4. Verify accessibility before returning.
+    Multi-stage path resolver that prioritizes logical paths.
+    1. Try logical path relative to LOGICAL_ROOT.
+    2. Try logical path as provided.
+    3. Try physical mapping as a fallback.
+    4. Try realpath only as a last resort.
     """
     if not path or not isinstance(path, str): return path
     
-    # Absolute path logic
+    # STEP 1: If path is within current workspace, use LOGICAL_ROOT as anchor
+    if LOGICAL_ROOT and not os.path.isabs(path):
+        candidate = os.path.normpath(os.path.join(LOGICAL_ROOT, path))
+        if os.path.exists(candidate):
+            return candidate
+            
+    # Absolute path normalization
     if os.path.isabs(path):
         base = os.path.normpath(path)
     else:
         base = os.path.normpath(os.path.join(CURRENT_WORKSPACE, path))
 
-    candidates = [base]
+    # STEP 2: Check existence with logical path directly
+    if os.path.exists(base):
+        return base
 
-    # Stage 1: Add logical/physical mappings to candidates
+    # STEP 3: Try physical mapping fallback (Downloads -> s)
+    candidates = []
     if re.search(r'(?i)[/\\\\]downloads([/\\\\]|$)', base):
         candidates.append(os.path.normpath(re.sub(r'(?i)[/\\\\]downloads([/\\\\]|$)', r'\\s\\', base)))
     if re.search(r'(?i)[/\\\\]s([/\\\\]|$)', base):
         candidates.append(os.path.normpath(re.sub(r'(?i)[/\\\\]s([/\\\\]|$)', r'\\Downloads\\', base)))
     
-    # Stage 2: Add realpath resolution
-    try:
-        candidates.append(os.path.normpath(os.path.realpath(base)))
-    except:
-        pass
+    # STEP 4: Try realpath (OS-level resolution)
+    # CRITICAL: Skip realpath for redirected folders (Downloads) to prevent D:\s leakage
+    is_redirected = any(p in base.lower() for p in ['downloads', '\\s\\'])
+    if not is_redirected:
+        try:
+            candidates.append(os.path.normpath(os.path.realpath(base)))
+        except:
+            pass
 
-    # Stage 3: Test candidates in order
+    # Test candidates in order
     def is_usable(p):
         try:
             if not os.path.exists(p): return False
             if os.path.isdir(p):
                 os.listdir(p) # Verify listable
             else:
-                # For files, just check if we can open for reading
-                with open(p, 'rb') as f:
-                    pass
+                with open(p, 'rb') as f: pass
             return True
         except:
             return False
@@ -179,7 +254,6 @@ def _get_operation_path(path: str) -> str:
         if is_usable(cand):
             return cand
             
-    # Final Fallback: Return original normalized path
     return base
 
 
@@ -198,6 +272,19 @@ def diagnose_path(path: str) -> Dict[str, Any]:
         "current_workspace": CURRENT_WORKSPACE
     }
     
+    # Junction/Symlink detection (Windows specific)
+    try:
+        import ctypes
+        FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(full)
+        results["is_junction"] = bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT) if attrs != 0xFFFFFFFF else False
+        if results["is_junction"]:
+            import subprocess
+            res = subprocess.run(['fsutil', 'reparsepoint', 'query', full], capture_output=True, text=True, shell=True)
+            results["junction_info"] = res.stdout[:500] if res.returncode == 0 else "fsutil failed"
+    except:
+        results["is_junction"] = False
+    
     # Try shell visibility
     try:
         import subprocess
@@ -214,25 +301,32 @@ def diagnose_path(path: str) -> Dict[str, Any]:
 def set_workspace(path: str) -> Dict[str, Any]:
     global CURRENT_WORKSPACE, LOGICAL_ROOT, PHYSICAL_ROOT
     
-    # 1. Normalize and aggressively sanitize back to Downloads
-    norm = os.path.normpath(path).replace('/', '\\')
-    if norm.lower().startswith("d:\\s"):
-        norm = "D:\\Downloads" + norm[4:]
+    # 1. Canonicalize the workspace path to its logical form
+    logical_workspace = resolve_workspace_path(path)
     
     # 2. Check if logical exists, otherwise fallback to physical
-    if os.path.exists(norm):
-        CURRENT_WORKSPACE = norm
+    if os.path.exists(logical_workspace):
+        CURRENT_WORKSPACE = logical_workspace
     elif os.path.exists(path):
         CURRENT_WORKSPACE = os.path.normpath(path)
     else:
         return {"error": f"Path not found: {path}"}
         
     # 3. Establish Junction Mappings for this session
-    if "downloads" in CURRENT_WORKSPACE.lower():
-        LOGICAL_ROOT = "D:\\Downloads"
-        PHYSICAL_ROOT = "D:\\s"
-    else:
-        LOGICAL_ROOT = CURRENT_WORKSPACE
+    # We use normpath and realpath to detect the physical underlying folder
+    LOGICAL_ROOT = CURRENT_WORKSPACE
+    try:
+        # Detect if this logical path points to a different physical path
+        physical = os.path.normpath(os.path.realpath(CURRENT_WORKSPACE))
+        if physical.lower() != CURRENT_WORKSPACE.lower():
+            PHYSICAL_ROOT = physical
+        else:
+            # Check for the common 's' junction on D:
+            if 'downloads' in CURRENT_WORKSPACE.lower():
+                PHYSICAL_ROOT = CURRENT_WORKSPACE.lower().replace('\\downloads', '\\s')
+            else:
+                PHYSICAL_ROOT = CURRENT_WORKSPACE
+    except:
         PHYSICAL_ROOT = CURRENT_WORKSPACE
         
     _init_db()
@@ -259,8 +353,18 @@ def requires_approval(tool_name: str, args: Dict[str, Any]) -> bool:
     if tool_name in {"run_command", "run_shell_command", "start_background_command"}:
         cmd = args.get("command", "").lower()
         return not any(cmd.startswith(safe) for safe in SAFE_COMMANDS)
+        
+    if tool_name in {"write_file", "append_file"}:
+        path = args.get("path")
+        if path:
+            full = _get_operation_path(path)
+            # Require approval ONLY if the file already exists
+            if os.path.exists(full):
+                return True
+        return False
+        
     return tool_name in {
-        "write_file", "edit_file", "append_file", "move_file", "copy_file", "delete_file"
+        "edit_file", "move_file", "copy_file", "delete_file"
     }
 
 
@@ -462,6 +566,10 @@ def read_files(paths: List[str]) -> Dict[str, Any]:
                             content = f.read().decode("utf-8", errors="replace")
                     _file_cache[full] = (mtime, content)
             
+            if len(content) > MAX_SINGLE_FILE_CHARS:
+                errors[path] = f"File too large for batch ({len(content)} chars). Use read_file individually."
+                continue
+
             if total_chars + len(content) > MAX_BATCH_CHARS:
                 errors[path] = "Batch capacity reached"
                 break
@@ -481,6 +589,13 @@ def read_files(paths: List[str]) -> Dict[str, Any]:
 
 def write_file(path: str, content: str = "", lines: Optional[List[str]] = None,
                content_base64: str = "", lines_base64: Optional[List[str]] = None) -> Dict[str, Any]:
+    # ENFORCEMENT: For code files, require lines, base64, or non-empty content (raw block)
+    is_code_file = path.lower().endswith(('.py', '.js', '.ts', '.html', '.css', '.json', '.yaml', '.yml', '.md', '.sh', '.bat'))
+    if is_code_file and not (content_base64 or lines_base64 or lines is not None or content):
+        return {
+            "error": f"Code file '{path}' requires 'lines' (array) or base64 encoding to preserve indentation. Please use 'lines' (recommended for Unicode) or 'lines_base64'.",
+            "hint": "Raw multiline 'content' string strips leading spaces in JSON. Use 'lines'."
+        }
     if content_base64:
         content = _decode_base64(content_base64)
     elif lines_base64 is not None:
@@ -503,6 +618,13 @@ def edit_file(path: str, target: str = "", replacement: str = "",
               target_lines: Optional[List[str]] = None, replacement_lines: Optional[List[str]] = None,
               target_base64: str = "", replacement_base64: str = "",
               target_lines_base64: Optional[List[str]] = None, replacement_lines_base64: Optional[List[str]] = None) -> Dict[str, Any]:
+    # ENFORCEMENT: For code files, require lines or base64 to preserve indentation
+    is_code_file = path.lower().endswith(('.py', '.js', '.ts', '.html', '.css', '.json', '.yaml', '.yml', '.md', '.sh', '.bat'))
+    if is_code_file and not (target_base64 or replacement_base64 or target_lines_base64 or replacement_lines_base64 or target_lines is not None or replacement_lines is not None):
+         return {
+            "error": f"Editing code file '{path}' requires 'lines' (array) or base64 encoding to preserve indentation. Please use 'target_lines' and 'replacement_lines'.",
+            "hint": "Raw multiline 'content' string strips leading spaces in JSON. Use 'lines'."
+        }
     if target_base64:
         target = _decode_base64(target_base64)
     if replacement_base64:
@@ -661,7 +783,60 @@ def resolve_path(path: str) -> Dict[str, Any]:
 def list_files(path: str = ".") -> Dict[str, Any]:
     full = _get_operation_path(path)
     try:
-        return {"files": os.listdir(full), "path": sanitize_path(full)}
+        entries = os.listdir(full)
+        valid_entries = []
+        dead_junctions = []
+        for entry in entries:
+            entry_path = os.path.join(full, entry)
+            # Skip dead junctions (dir entry exists but target is missing)
+            if os.path.isdir(entry_path) and not os.path.exists(entry_path):
+                dead_junctions.append(entry)
+                continue
+            valid_entries.append(entry)
+            
+        res = {"files": valid_entries, "path": sanitize_path(full)}
+        if dead_junctions:
+            res["note"] = f"Filtered out {len(dead_junctions)} dead junctions: {dead_junctions}"
+        return res
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def verify_junction(path: str) -> Dict[str, Any]:
+    """Check if path is a junction point and verify its target exists."""
+    full = _get_operation_path(path)
+    results = {"path": sanitize_path(full), "exists": os.path.exists(full)}
+    try:
+        import ctypes
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(full)
+        results["is_junction"] = bool(attrs & 0x400) if attrs != 0xFFFFFFFF else False
+        if results["is_junction"]:
+            import subprocess
+            res = subprocess.run(['fsutil', 'reparsepoint', 'query', full], capture_output=True, text=True, shell=True)
+            if res.returncode == 0:
+                match = re.search(r'Substitute Name:.*?([A-Za-z]:\\[^\n\r]+)', res.stdout)
+                target = match.group(1).replace('\\??\\', '') if match else "Unknown"
+                results["target"] = target
+                results["target_exists"] = os.path.exists(target)
+    except Exception as e:
+        results["error"] = str(e)
+    return results
+
+
+def resolve_junction(path: str) -> Dict[str, Any]:
+    """Follow a junction point to its physical target using Windows API."""
+    full = _get_operation_path(path)
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        # FILE_FLAG_BACKUP_SEMANTICS = 0x02000000, OPEN_EXISTING = 3, GENERIC_READ = 0x80000000
+        handle = kernel32.CreateFileW(full, 0x80000000, 1, None, 3, 0x02000000, None)
+        if handle == -1: return {"error": "Failed to open handle to junction"}
+        buf = ctypes.create_unicode_buffer(1024)
+        kernel32.GetFinalPathNameByHandleW(handle, buf, 1024, 0)
+        kernel32.CloseHandle(handle)
+        physical = buf.value.replace('\\\\?\\', '')
+        return {"original": sanitize_path(full), "physical": physical, "exists": os.path.exists(physical)}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1013,6 +1188,436 @@ def get_definition(file: str, line: int, column: int) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+# =============================================================================
+# EXTENDED TOOLS (PRIORITIES 1-3)
+# =============================================================================
+
+def get_env_var(name: str) -> Dict[str, Any]:
+    """Get environment variable value."""
+    value = os.environ.get(name)
+    return {"name": name, "value": value, "exists": value is not None}
+
+
+def set_env_var(name: str, value: str, permanent: bool = False) -> Dict[str, Any]:
+    """Set environment variable."""
+    os.environ[name] = value
+    
+    if permanent and sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, None)
+        except:
+            pass
+    
+    return {"status": "success", "name": name, "value": value}
+
+
+def get_system_info() -> Dict[str, Any]:
+    """Get comprehensive system information."""
+    info = {
+        "os": platform.system(),
+        "os_version": platform.version(),
+        "os_release": platform.release(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "python_version": sys.version,
+        "cpu_count": os.cpu_count(),
+        "hostname": platform.node(),
+    }
+    
+    if HAVE_PSUTIL:
+        import psutil
+        mem = psutil.virtual_memory()
+        info["ram_total_gb"] = round(mem.total / (1024**3), 2)
+        info["ram_available_gb"] = round(mem.available / (1024**3), 2)
+        info["ram_percent_used"] = mem.percent
+        
+        disk = psutil.disk_usage('/')
+        info["disk_total_gb"] = round(disk.total / (1024**3), 2)
+        info["disk_free_gb"] = round(disk.free / (1024**3), 2)
+        info["disk_percent_used"] = disk.percent
+    
+    return info
+
+
+def is_admin() -> Dict[str, Any]:
+    """Check for admin/root privileges."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except:
+            is_admin = False
+    else:
+        is_admin = os.getuid() == 0 if hasattr(os, 'getuid') else False
+    
+    return {"is_admin": is_admin}
+
+
+def download_file(url: str, dest: str, resume: bool = False, timeout: int = 300) -> Dict[str, Any]:
+    """Download a file with resume support."""
+    dest_path = Path(dest)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    existing_size = dest_path.stat().st_size if resume and dest_path.exists() else 0
+    headers = {'Range': f'bytes={existing_size}-'} if existing_size > 0 else {}
+    
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            mode = 'ab' if existing_size > 0 else 'wb'
+            with open(dest_path, mode) as f:
+                while True:
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        
+        return {
+            "status": "success",
+            "path": str(dest_path),
+            "size_bytes": dest_path.stat().st_size,
+            "resumed": existing_size > 0
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def extract_archive(path: str, dest: str = None) -> Dict[str, Any]:
+    """Extract ZIP, TAR, GZ, or TAR.GZ archives."""
+    src_path = Path(path)
+    if not src_path.exists():
+        return {"error": f"Archive not found: {path}"}
+    
+    dest_path = Path(dest) if dest else src_path.parent / src_path.stem
+    dest_path.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        if src_path.suffix == '.zip':
+            import zipfile
+            with zipfile.ZipFile(src_path, 'r') as zf:
+                zf.extractall(dest_path)
+        elif src_path.suffix in ('.tar', '.gz', '.tgz'):
+            import tarfile
+            mode = 'r:gz' if src_path.suffix in ('.gz', '.tgz') else 'r'
+            with tarfile.open(src_path, mode) as tf:
+                tf.extractall(dest_path)
+        else:
+            return {"error": f"Unsupported format: {src_path.suffix}"}
+        
+        return {"status": "success", "extracted_to": str(dest_path)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def git_clone(repo_url: str, dest: str, branch: str = None, depth: int = None) -> Dict[str, Any]:
+    """Clone a git repository."""
+    if not HAVE_GIT:
+        return {"error": "GitPython not installed."}
+    
+    dest_path = Path(dest)
+    try:
+        import git
+        repo = git.Repo.clone_from(repo_url, str(dest_path), branch=branch, depth=depth)
+        return {
+            "status": "success",
+            "path": str(dest_path),
+            "branch": branch or repo.active_branch.name,
+            "commit": str(repo.head.commit.hexsha)[:8]
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def git_pull(path: str) -> Dict[str, Any]:
+    """Pull latest changes in a git repository."""
+    if not HAVE_GIT:
+        return {"error": "GitPython not installed"}
+    
+    try:
+        import git
+        repo = git.Repo(path)
+        origin = repo.remotes.origin
+        pull_info = origin.pull()
+        return {
+            "status": "success",
+            "path": path,
+            "after_commit": str(pull_info[0].commit.hexsha)[:8] if pull_info else "up-to-date"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def http_get(url: str, headers: Dict[str, str] = None, timeout: int = 30) -> Dict[str, Any]:
+    """Make HTTP GET request."""
+    req_headers = headers or {'User-Agent': 'ZeroBound-Agent/1.0'}
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers=req_headers)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            content = response.read().decode('utf-8', errors='replace')
+            return {
+                "status_code": response.status,
+                "content": content[:10000],
+                "truncated": len(content) > 10000,
+                "headers": dict(response.headers)
+            }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def http_post(url: str, data: str = None, json_data: Dict = None, headers: Dict[str, str] = None) -> Dict[str, Any]:
+    """Make HTTP POST request."""
+    req_headers = headers or {'User-Agent': 'ZeroBound-Agent/1.0', 'Content-Type': 'application/json'}
+    if json_data:
+        body = json.dumps(json_data).encode('utf-8')
+    elif data:
+        body = data.encode('utf-8')
+    else:
+        body = b''
+    
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, data=body, headers=req_headers, method='POST')
+        with urllib.request.urlopen(req, timeout=30) as response:
+            content = response.read().decode('utf-8', errors='replace')
+            return {
+                "status_code": response.status,
+                "content": content[:10000],
+                "truncated": len(content) > 10000
+            }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+class FileWatcher:
+    """Simple file/directory watcher."""
+    def __init__(self):
+        self.active_watchers = {}
+    
+    def watch(self, path: str, recursive: bool = False) -> Dict[str, Any]:
+        watcher_id = f"watcher_{int(time.time())}_{hash(path)}"
+        def get_snapshot():
+            snap = {}
+            path_obj = Path(path)
+            if path_obj.is_file():
+                snap[path] = path_obj.stat().st_mtime
+            else:
+                pattern = '**/*' if recursive else '*'
+                for p in path_obj.glob(pattern):
+                    if p.is_file(): snap[str(p)] = p.stat().st_mtime
+            return snap
+        
+        self.active_watchers[watcher_id] = {'path': path, 'initial': get_snapshot(), 'recursive': recursive}
+        return {"watcher_id": watcher_id, "message": f"Watching {path}"}
+    
+    def check_changes(self, watcher_id: str) -> Dict[str, Any]:
+        if watcher_id not in self.active_watchers: return {"error": "Watcher not found"}
+        w = self.active_watchers[watcher_id]
+        path = Path(w['path'])
+        new_snap = {}
+        if path.is_file():
+            if path.exists(): new_snap[str(path)] = path.stat().st_mtime
+        else:
+            pattern = '**/*' if w['recursive'] else '*'
+            for p in path.glob(pattern):
+                if p.is_file(): new_snap[str(p)] = p.stat().st_mtime
+        
+        old = w['initial']
+        changes = []
+        for f, mt in new_snap.items():
+            if f not in old: changes.append({'file': f, 'event': 'created'})
+            elif old[f] != mt: changes.append({'file': f, 'event': 'modified'})
+        for f in old:
+            if f not in new_snap: changes.append({'file': f, 'event': 'deleted'})
+        w['initial'] = new_snap
+        return {"watcher_id": watcher_id, "changes": changes}
+
+_file_watcher = FileWatcher()
+
+def watch_directory(path: str, recursive: bool = False) -> Dict[str, Any]:
+    """Start watching a directory for changes."""
+    return _file_watcher.watch(path, recursive)
+
+def check_file_changes(watcher_id: str) -> Dict[str, Any]:
+    """Check for file changes."""
+    return _file_watcher.check_changes(watcher_id)
+
+def lock_file(path: str, timeout: int = 30) -> Dict[str, Any]:
+    """Acquire an advisory lock on a file."""
+    lock_path = Path(f"{path}.lock")
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                f = open(lock_path, 'w')
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                return {"status": "locked", "lock_file": str(lock_path)}
+            else:
+                import fcntl
+                f = open(lock_path, 'w')
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return {"status": "locked", "lock_file": str(lock_path)}
+        except: time.sleep(0.1)
+    return {"error": f"Timeout acquiring lock on {path}"}
+
+def get_process_tree(pid: int = None) -> Dict[str, Any]:
+    """Get process tree (requires psutil)."""
+    if not HAVE_PSUTIL: return {"error": "psutil not installed."}
+    pid = pid or os.getpid()
+    def get_children(p):
+        return [{'pid': c.pid, 'name': c.name(), 'children': get_children(c)} for c in p.children()]
+    try:
+        import psutil
+        proc = psutil.Process(pid)
+        return {'pid': pid, 'name': proc.name(), 'children': get_children(proc)}
+    except Exception as e: return {"error": str(e)}
+
+def send_signal(pid: int, signal: str) -> Dict[str, Any]:
+    """Send a signal to a process (SIGINT, SIGTERM, SIGKILL)."""
+    sig_map = {'SIGINT': 2, 'SIGTERM': 15, 'SIGKILL': 9}
+    if signal not in sig_map: return {"error": f"Unknown signal: {signal}"}
+    try:
+        os.kill(pid, sig_map[signal])
+        return {"status": "sent", "signal": signal, "pid": pid}
+    except Exception as e: return {"error": str(e)}
+
+
+# =============================================================================
+# EXTENDED TOOLS (PRIORITIES 4-7)
+# =============================================================================
+
+def pip_install(packages: List[str], upgrade: bool = False) -> Dict[str, Any]:
+    """Install Python packages."""
+    cmd = [sys.executable, '-m', 'pip', 'install']
+    if upgrade: cmd.append('--upgrade')
+    cmd.extend(packages)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return {"status": "success" if result.returncode == 0 else "failed", "stdout": result.stdout[-1000:]}
+    except Exception as e: return {"error": str(e)}
+
+def pip_list() -> Dict[str, Any]:
+    """List installed packages."""
+    try:
+        result = subprocess.run([sys.executable, '-m', 'pip', 'list', '--format=json'], capture_output=True, text=True)
+        return {"packages": json.loads(result.stdout)}
+    except Exception as e: return {"error": str(e)}
+
+def create_virtual_env(path: str) -> Dict[str, Any]:
+    """Create a Python virtual environment."""
+    try:
+        subprocess.run([sys.executable, '-m', 'venv', path], check=True)
+        return {"status": "success", "path": path}
+    except Exception as e: return {"error": str(e)}
+
+def find_symbol_definition(symbol: str, path: str = ".") -> Dict[str, Any]:
+    """Find where a symbol is defined using regex."""
+    root = _get_operation_path(path)
+    results = []
+    patterns = [rf'def\s+{symbol}\s*\(', rf'class\s+{symbol}\s*[:\(]', rf'{symbol}\s*=']
+    for py_file in Path(root).rglob('*.py'):
+        try:
+            with open(py_file, 'r', encoding='utf-8', errors='ignore') as f:
+                for i, line in enumerate(f, 1):
+                    if any(re.search(p, line) for p in patterns):
+                        results.append({'file': str(py_file), 'line': i, 'content': line.strip()})
+        except: continue
+    return {'symbol': symbol, 'definitions': results[:50]}
+
+def find_all_references(symbol: str, path: str = ".") -> Dict[str, Any]:
+    """Find all references to a symbol."""
+    root = _get_operation_path(path)
+    results = []
+    pattern = rf'\b{symbol}\b'
+    for py_file in Path(root).rglob('*.py'):
+        try:
+            with open(py_file, 'r', encoding='utf-8', errors='ignore') as f:
+                for i, line in enumerate(f, 1):
+                    if re.search(pattern, line):
+                        results.append({'file': str(py_file), 'line': i, 'content': line.strip()})
+        except: continue
+    return {'symbol': symbol, 'references': results[:100]}
+
+def get_imports(file_path: str) -> Dict[str, Any]:
+    """Parse Python imports from a file."""
+    path = _get_operation_path(file_path)
+    imports = []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith(('import ', 'from ')): imports.append(line.strip())
+        return {"file": file_path, "imports": imports}
+    except Exception as e: return {"error": str(e)}
+
+def run_pytest_coverage(path: str = ".") -> Dict[str, Any]:
+    """Run pytest with coverage."""
+    cmd = [sys.executable, '-m', 'pytest', path, '--cov=' + path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return {"passed": result.returncode == 0, "stdout": result.stdout[-2000:]}
+    except Exception as e: return {"error": str(e)}
+
+def run_linter(path: str) -> Dict[str, Any]:
+    """Run ruff linter on the codebase."""
+    try:
+        result = subprocess.run(['ruff', 'check', path], capture_output=True, text=True)
+        return {"output": result.stdout[-2000:]}
+    except: return {"error": "ruff not installed."}
+
+def read_data(file_path: str) -> Dict[str, Any]:
+    """Read data file into pandas summary."""
+    if not HAVE_PANDAS: return {"error": "pandas not installed."}
+    path = _get_operation_path(file_path)
+    try:
+        df = pd.read_csv(path) if path.endswith('.csv') else pd.read_excel(path)
+        return {"shape": list(df.shape), "columns": list(df.columns), "head": df.head(5).to_dict()}
+    except Exception as e: return {"error": str(e)}
+
+def plot_save(data: Dict, plot_type: str = "line", save_path: str = "plot.png") -> Dict[str, Any]:
+    """Create and save a plot."""
+    if not HAVE_MATPLOTLIB: return {"error": "matplotlib not installed."}
+    try:
+        df = pd.DataFrame(data)
+        plt.figure(figsize=(10, 6))
+        if plot_type == 'line': df.plot()
+        elif plot_type == 'bar': df.plot(kind='bar')
+        plt.savefig(save_path)
+        plt.close()
+        return {"status": "success", "saved_to": save_path}
+    except Exception as e: return {"error": str(e)}
+
+def run_notebook(path: str, output: str = None) -> Dict[str, Any]:
+    """Execute a Jupyter notebook."""
+    try:
+        import nbformat
+        from nbconvert.preprocessors import ExecutePreprocessor
+        with open(path) as f:
+            nb = nbformat.read(f, as_version=4)
+        ep = ExecutePreprocessor(timeout=600, kernel_name='python3')
+        ep.preprocess(nb, {'metadata': {'path': os.path.dirname(path)}})
+        if output:
+            with open(output, 'w') as f: nbformat.write(nb, f)
+        return {"status": "success"}
+    except Exception as e: return {"error": str(e)}
+
+def create_requirements(path: str = ".", output: str = "requirements.txt") -> Dict[str, Any]:
+    """Generate requirements.txt from imports."""
+    imports = set()
+    for py_file in Path(path).rglob('*.py'):
+        try:
+            with open(py_file, 'r') as f:
+                for line in f:
+                    if line.startswith('import '): imports.add(line.split()[1].split('.')[0])
+                    elif line.startswith('from '): imports.add(line.split()[1].split('.')[0])
+        except: continue
+    with open(output, 'w') as f:
+        for imp in sorted(imports): f.write(f"{imp}\n")
+    return {"status": "success", "file": output}
+
+
 # ---------------------------------------------------------------------------
 # Tool dispatcher
 # ---------------------------------------------------------------------------
@@ -1041,6 +1646,8 @@ TOOL_MAP = {
     "get_file_info": (get_file_info, False),
     "resolve_path": (resolve_path, False),
     "diagnose_path": (diagnose_path, False),
+    "verify_junction": (verify_junction, False),
+    "resolve_junction": (resolve_junction, False),
     "search_web": (search_web, True),
     "read_url": (read_url, True),
     "store_memory": (store_memory, False),
@@ -1049,6 +1656,35 @@ TOOL_MAP = {
     "git_diff": (git_diff, False),
     "run_tests": (run_tests, False),
     "get_definition": (get_definition, False),
+    
+    # Extended Tools (Priority 1-7)
+    "get_env_var": (get_env_var, False),
+    "set_env_var": (set_env_var, False),
+    "get_system_info": (get_system_info, False),
+    "is_admin": (is_admin, False),
+    "download_file": (download_file, False),
+    "extract_archive": (extract_archive, False),
+    "git_clone": (git_clone, False),
+    "git_pull": (git_pull, False),
+    "http_get": (http_get, False),
+    "http_post": (http_post, False),
+    "watch_directory": (watch_directory, False),
+    "check_file_changes": (check_file_changes, False),
+    "lock_file": (lock_file, False),
+    "get_process_tree": (get_process_tree, False),
+    "send_signal": (send_signal, False),
+    "pip_install": (pip_install, False),
+    "pip_list": (pip_list, False),
+    "create_virtual_env": (create_virtual_env, False),
+    "find_symbol_definition": (find_symbol_definition, False),
+    "find_all_references": (find_all_references, False),
+    "get_imports": (get_imports, False),
+    "run_pytest_coverage": (run_pytest_coverage, False),
+    "run_linter": (run_linter, False),
+    "read_data": (read_data, False),
+    "plot_save": (plot_save, False),
+    "run_notebook": (run_notebook, False),
+    "create_requirements": (create_requirements, False),
 }
 
 
@@ -1471,6 +2107,240 @@ TOOLS = [
         "name": "get_knowledge_stats",
         "description": "Get statistics from the pattern learning system.",
         "parameters": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "get_env_var",
+        "description": "Get environment variable value.",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"]
+        }
+    },
+    {
+        "name": "set_env_var",
+        "description": "Set environment variable (permanent requires admin).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "value": {"type": "string"},
+                "permanent": {"type": "boolean", "default": False}
+            },
+            "required": ["name", "value"]
+        }
+    },
+    {
+        "name": "get_system_info",
+        "description": "Get comprehensive system information (OS, CPU, RAM, Disk).",
+        "parameters": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "download_file",
+        "description": "Download a file from URL with resume support.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "dest": {"type": "string"},
+                "resume": {"type": "boolean", "default": False}
+            },
+            "required": ["url", "dest"]
+        }
+    },
+    {
+        "name": "extract_archive",
+        "description": "Extract ZIP or TAR archives.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "dest": {"type": "string", "description": "Optional destination folder"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "git_clone",
+        "description": "Clone a git repository.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo_url": {"type": "string"},
+                "dest": {"type": "string"},
+                "branch": {"type": "string", "default": None},
+                "depth": {"type": "integer", "default": None}
+            },
+            "required": ["repo_url", "dest"]
+        }
+    },
+    {
+        "name": "git_pull",
+        "description": "Pull latest changes in a git repository.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "http_get",
+        "description": "Make HTTP GET request.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "headers": {"type": "object", "default": None}
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "http_post",
+        "description": "Make HTTP POST request.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "json_data": {"type": "object", "default": None},
+                "headers": {"type": "object", "default": None}
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "watch_directory",
+        "description": "Start watching a directory for changes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "recursive": {"type": "boolean", "default": False}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "check_file_changes",
+        "description": "Check for changes in a watched directory.",
+        "parameters": {
+            "type": "object",
+            "properties": {"watcher_id": {"type": "string"}},
+            "required": ["watcher_id"]
+        }
+    },
+    {
+        "name": "pip_install",
+        "description": "Install Python packages.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "packages": {"type": "array", "items": {"type": "string"}},
+                "upgrade": {"type": "boolean", "default": False}
+            },
+            "required": ["packages"]
+        }
+    },
+    {
+        "name": "pip_list",
+        "description": "List installed Python packages.",
+        "parameters": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "find_symbol_definition",
+        "description": "Find where a symbol is defined across files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "path": {"type": "string", "default": "."}
+            },
+            "required": ["symbol"]
+        }
+    },
+    {
+        "name": "find_all_references",
+        "description": "Find all references to a symbol across files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "path": {"type": "string", "default": "."}
+            },
+            "required": ["symbol"]
+        }
+    },
+    {
+        "name": "get_imports",
+        "description": "Extract imports from a Python file.",
+        "parameters": {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"]
+        }
+    },
+    {
+        "name": "run_pytest_coverage",
+        "description": "Run pytest with coverage reporting.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "default": "."}},
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "run_linter",
+        "description": "Run ruff linter on a path.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "read_data",
+        "description": "Read data (CSV/Excel) and show summary statistics.",
+        "parameters": {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"]
+        }
+    },
+    {
+        "name": "plot_save",
+        "description": "Create and save a plot from data.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "data": {"type": "object", "description": "Dictionary of lists"},
+                "plot_type": {"type": "string", "enum": ["line", "bar"], "default": "line"},
+                "save_path": {"type": "string", "default": "plot.png"}
+            },
+            "required": ["data"]
+        }
+    },
+    {
+        "name": "run_notebook",
+        "description": "Execute a Jupyter notebook.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "output": {"type": "string", "description": "Optional output path"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "create_requirements",
+        "description": "Generate requirements.txt from project imports.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "default": "."},
+                "output": {"type": "string", "default": "requirements.txt"}
+            }
+        }
     }
 ]
 

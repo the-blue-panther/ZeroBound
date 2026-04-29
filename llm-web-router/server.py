@@ -1,10 +1,10 @@
 """
-server.py – LLM Web Router (v2.0)
+server.py – LLM Web Router (v2.1.0)
 ==================================
 - Manages persistent browser sessions for DeepSeek / Claude
 - Implements a reliable completion endpoint with stability detection
 - Supports image uploads and session state persistence
-- Robust error handling and graceful shutdown
+- Robust error handling, session recovery, and fallback browser support
 """
 
 import os
@@ -14,51 +14,75 @@ import json
 import mimetypes
 import re
 import logging
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 import httpx
 
 from config import MODEL_CONFIG, DEFAULT_MODEL
 
 # ---------------------------------------------------------------------------
-# Lifespan manager
+# Configuration & Logging
 # ---------------------------------------------------------------------------
-from contextlib import asynccontextmanager
+PORT = int(os.getenv("ROUTER_PORT", 8000))
+HOST = os.getenv("ROUTER_HOST", "0.0.0.0")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+logging.basicConfig(level=getattr(logging, LOG_LEVEL), format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("llm-web-router")
 
 browser_instance: Optional[Browser] = None
 contexts: Dict[str, BrowserContext] = {}
+# Per-backend locks to prevent concurrent typing into the same page
+backend_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
+# ---------------------------------------------------------------------------
+# Lifespan manager
+# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global browser_instance, contexts
     playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(
-        headless=False,
-        channel="msedge",
-        args=["--start-maximized"]
-    )
+    
+    # Browser fallback logic
+    browser = None
+    for channel in ["msedge", "chrome", "chromium"]:
+        try:
+            logger.info("Attempting to launch browser: %s", channel)
+            browser = await playwright.chromium.launch(
+                headless=False,
+                channel=channel,
+                args=["--start-maximized", "--no-sandbox"]
+            )
+            logger.info("Successfully launched %s", channel)
+            break
+        except Exception as e:
+            logger.warning("Failed to launch %s: %s", channel, e)
+    
+    if not browser:
+        raise RuntimeError("No compatible browser found (Edge/Chrome/Chromium)")
+        
     browser_instance = browser
 
     for key, cfg in MODEL_CONFIG.items():
         state_path = f"{cfg['profile_dir']}/state.json"
         if not os.path.exists(state_path):
-            logger.warning("No session for %s; skipping", key)
+            logger.warning("No session for %s; skipping. Run manual_login.py first.", key)
             continue
+            
         logger.info("Loading browser context for %s", key)
         context = await browser.new_context(storage_state=state_path, no_viewport=True, color_scheme="dark")
         page = await context.new_page()
         await page.goto(cfg["url"], timeout=0)
         
         # Check if we landed on a login page
-        current_url = page.url
-        if "sign_in" in current_url or "login" in current_url:
-            logger.warning("⚠️ %s session expired or login required! Navigate to: %s", key, current_url)
-            logger.warning("Please run: python manual_login.py %s", key)
+        if "sign_in" in page.url or "login" in page.url:
+            logger.warning("⚠️ %s session expired or login required!", key)
         else:
             logger.info("✅ %s ready and logged in.", key)
             
@@ -68,28 +92,128 @@ async def lifespan(app: FastAPI):
     # Shutdown
     for ctx in contexts.values():
         await ctx.close()
-    if browser:
-        await browser.close()
+    if browser_instance:
+        await browser_instance.close()
     await playwright.stop()
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info("%s %s", request.method, request.url.path)
+    start = asyncio.get_event_loop().time()
+    response = await call_next(request)
+    elapsed = asyncio.get_event_loop().time() - start
+    logger.info("Completed %s in %.2fs", request.url.path, elapsed)
+    return response
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 async def find_and_act(page: Page, selectors: List[str], action: str, data: Optional[str] = None) -> bool:
+    # Wait ONCE for any of the selectors (max 5 seconds), instead of sequentially waiting 5s per selector
+    combined = ", ".join(selectors)
+    try:
+        await page.wait_for_selector(combined, timeout=5000, state="visible")
+    except Exception:
+        pass # If CSS fails, we fall through to JS heuristics anyway
+
+    # Strategy 1: Try CSS selectors instantly
     for sel in selectors:
         try:
-            await page.wait_for_selector(sel, timeout=3000)
-            loc = page.locator(sel)
-            if action == "fill":
-                await loc.fill("")
-                await loc.fill(data)
-            elif action == "click":
-                await loc.click()
-            return True
+            loc = page.locator(sel).first
+            if await loc.is_visible():
+                if action == "fill":
+                    await loc.click(timeout=1000)
+                    await loc.fill("", timeout=1000)
+                    await loc.fill(data, timeout=1000)
+                elif action == "click":
+                    await loc.click(timeout=1000)
+                return True
         except Exception:
             continue
+
+    # Strategy 2: JavaScript value injection (no keyboard events, safe for any UI state)
+    if action == "fill" and data is not None:
+        try:
+            safe_data = data.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+            result = await page.evaluate(f"""
+                () => {{
+                    const candidates = [
+                        ...document.querySelectorAll('textarea'),
+                        ...document.querySelectorAll('[contenteditable="true"]'),
+                        ...document.querySelectorAll('input[type="text"]')
+                    ];
+                    const el = candidates.find(e => {{
+                        const r = e.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0 && window.getComputedStyle(e).display !== 'none';
+                    }});
+                    if (!el) return false;
+                    el.focus();
+                    // For textarea/input: set value property
+                    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {{
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value') || 
+                                                        Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                        nativeInputValueSetter.set.call(el, `{safe_data}`);
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }} else {{
+                        // For contenteditable
+                        el.textContent = `{safe_data}`;
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    }}
+                    return true;
+                }}
+            """)
+            if result:
+                logger.info("JS value injection succeeded")
+                return True
+        except Exception as e:
+            logger.warning("JS fallback failed: %s", e)
+
+    # Strategy 3: JS fallback for click (e.g. finding the Send button)
+    if action == "click":
+        try:
+            target_rect = await page.evaluate("""
+                () => {
+                    // Try to find the send button heuristically
+                    const btns = Array.from(document.querySelectorAll('button, div[role="button"], .ds-icon-button, [aria-label]'));
+                    const visibleBtns = btns.filter(b => b.offsetWidth > 0 && b.offsetHeight > 0 && window.getComputedStyle(b).display !== 'none' && !b.disabled);
+                    
+                    let target = visibleBtns.find(b => {
+                        const text = (b.innerText || '').toLowerCase();
+                        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                        return text.includes('send') || aria.includes('send');
+                    });
+                    
+                    if (!target) {
+                        // DeepSeek specific: The send button is the last .ds-icon-button in the DOM, 
+                        // and it gets a blue background when active.
+                        const iconBtns = visibleBtns.filter(b => b.matches('.ds-icon-button'));
+                        target = iconBtns.find(b => {
+                            const bg = window.getComputedStyle(b).backgroundColor;
+                            return bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent' && bg !== 'rgb(255, 255, 255)' && !bg.includes('var(');
+                        });
+                        if (!target && iconBtns.length > 0) {
+                            target = iconBtns[iconBtns.length - 1]; // Fallback to the very last one (usually send)
+                        }
+                    }
+                    
+                    if (target) {
+                        const r = target.getBoundingClientRect();
+                        return {x: r.x + r.width/2, y: r.y + r.height/2};
+                    }
+                    return null;
+                }
+            """)
+            if target_rect and isinstance(target_rect, dict) and 'x' in target_rect:
+                await page.mouse.click(target_rect['x'], target_rect['y'])
+                logger.info("JS click fallback succeeded (via mouse.click)")
+                return True
+        except Exception as e:
+            logger.warning("JS click fallback failed: %s", e)
+
     return False
 
 
@@ -128,28 +252,70 @@ async def upload_images(page: Page, cfg: Dict, urls: List[str]):
     raise RuntimeError("Could not upload images")
 
 
-async def get_response(page: Page, cfg: Dict, prompt: str, image_urls: Optional[List[str]] = None) -> str:
+async def is_generating(page: Page, cfg: Dict) -> bool:
+    try:
+        if await page.locator(cfg["stop_selector"]).count() > 0:
+            return True
+        # JS heuristic fallback: looks for any visible button with 'stop' text, aria-label, or an SVG square
+        return await page.evaluate("""
+            () => {
+                const btns = Array.from(document.querySelectorAll('button, div[role="button"], .ds-icon-button, [aria-label]'));
+                return btns.some(b => {
+                    if (b.offsetWidth === 0 || b.offsetHeight === 0 || window.getComputedStyle(b).display === 'none') return false;
+                    const text = b.innerText.toLowerCase();
+                    const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                    const hasStopSquare = !!b.querySelector('svg rect:not([fill="none"])');
+                    return text.includes('stop') || aria.includes('stop') || hasStopSquare;
+                });
+            }
+        """)
+    except Exception:
+        return False
+
+
+async def get_response(page: Page, cfg: Dict, prompt: str, request: Request, image_urls: Optional[List[str]] = None) -> str:
     """Send prompt and wait for complete response with stability detection."""
+    
+    # Session recovery check
+    if "sign_in" in page.url or "login" in page.url:
+        logger.warning("Session expired mid-run, attempting reload...")
+        state_path = f"{cfg['profile_dir']}/state.json"
+        if os.path.exists(state_path):
+            await page.context.storage_state(path=state_path)
+            await page.goto(cfg["url"])
+            await page.wait_for_load_state("networkidle")
+
     msg_before = await page.locator(cfg["response_container"]).count()
 
     if image_urls:
         await upload_images(page, cfg, image_urls)
 
     if not await find_and_act(page, cfg["input_selectors"], "fill", prompt):
-        raise RuntimeError("Could not find input box")
+        # Recovery: page may be in a broken state — reload and retry once
+        logger.warning("Input box not found, attempting page reload recovery...")
+        try:
+            await page.reload(timeout=30000, wait_until="networkidle")
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.warning("Reload failed: %s", e)
+        if not await find_and_act(page, cfg["input_selectors"], "fill", prompt):
+            raise RuntimeError("Could not find input box (even after reload)")
     if not await find_and_act(page, cfg["send_selectors"], "click"):
+        # If click fails, input box should still be focused by the fill fallback
         await page.keyboard.press("Enter")
 
-    # Wait for new response bubble
+    # Wait for new response bubble or generation to start
     for _ in range(30):
         if await page.locator(cfg["response_container"]).count() > msg_before:
+            break
+        if await is_generating(page, cfg):
             break
         await asyncio.sleep(1)
 
     # ── Phase 1: wait for generation to start ──
     started = False
     for _ in range(40):
-        if await page.locator(cfg["stop_selector"]).count() > 0:
+        if await is_generating(page, cfg):
             started = True
             break
         await asyncio.sleep(0.5)
@@ -163,16 +329,23 @@ async def get_response(page: Page, cfg: Dict, prompt: str, image_urls: Optional[
 
     while True:
         await asyncio.sleep(0.5)
+        if await request.is_disconnected():
+            logger.warning("Client disconnected; aborting wait.")
+            return "Disconnected"
+        
         elapsed = asyncio.get_event_loop().time() - start
         try:
-            current = await page.locator(cfg["response_container"]).last.inner_text()
+            current = await page.locator(cfg["response_container"]).last.inner_text(timeout=100)
         except Exception:
-            continue
+            current = await page.evaluate("""
+                () => {
+                    const containers = Array.from(document.querySelectorAll('div.prose, div[class*="message"], div[class*="markdown"], div[class*="content"]'));
+                    return containers.length > 0 ? containers[containers.length - 1].innerText : "";
+                }
+            """)
 
-        generating = await page.locator(cfg["stop_selector"]).count() > 0
+        generating = await is_generating(page, cfg)
 
-        # If we see </REPORT>, we are almost certainly done.
-        # But we still check 'generating' to avoid cutting off trailing code block markers.
         if "</REPORT>" in current and not generating:
             last_text = current
             break
@@ -185,40 +358,87 @@ async def get_response(page: Page, cfg: Dict, prompt: str, image_urls: Optional[
             stable_since = 0.0
         last_text = current
 
-        # Standard stability exit (for ACTION-only responses or if tags are missing)
         if stable_since >= STABILITY:
             break
         if elapsed > MAX_WAIT:
             break
 
-    # Final clean extraction (strip UI noise)
+    # Final clean extraction
     try:
-        await page.locator(cfg["response_container"]).last.scroll_into_view_if_needed()
+        await page.locator(cfg["response_container"]).last.scroll_into_view_if_needed(timeout=100)
         await page.wait_for_timeout(500)
-
         final = await page.locator(cfg["response_container"]).last.evaluate("""
             (container) => {
-                // Force pre-wrap to prevent innerText from collapsing spaces
-                const oldStyle = container.style.whiteSpace;
-                container.style.whiteSpace = 'pre-wrap';
+                // Clone to avoid breaking the live UI
+                const clone = container.cloneNode(true);
+                clone.style.display = 'none'; // hide it
+                document.body.appendChild(clone);
+                
                 try {
-                    return container.innerText
+                    // 1. Restore LaTeX from KaTeX/MathJax elements
+                    const mathElems = clone.querySelectorAll('.katex, .math, mjx-container, .math-inline, .math-block');
+                    mathElems.forEach(el => {
+                        let tex = null;
+                        let isBlock = el.classList.contains('katex-display') || el.tagName.toLowerCase() === 'mjx-container' && el.hasAttribute('display');
+                        
+                        // Try to find math[alttext]
+                        const mathTag = el.querySelector('math[alttext]');
+                        if (mathTag) {
+                            tex = mathTag.getAttribute('alttext');
+                            if (mathTag.getAttribute('display') === 'block') isBlock = true;
+                        } 
+                        // Try to find annotation
+                        if (!tex) {
+                            const annotation = el.querySelector('annotation[encoding="application/x-tex"]');
+                            if (annotation) tex = annotation.textContent;
+                        }
+                        // Try script tag (older MathJax)
+                        if (!tex) {
+                            const script = el.querySelector('script[type^="math/tex"]');
+                            if (script) {
+                                tex = script.textContent;
+                                if (script.type.includes('mode=display')) isBlock = true;
+                            }
+                        }
+                        
+                        if (tex) {
+                            const delim = isBlock ? '$$\\n' : '$';
+                            const replacement = document.createTextNode(delim + tex + (isBlock ? '\\n$$' : '$'));
+                            el.replaceWith(replacement);
+                        }
+                    });
+
+                    // 2. Extract innerText with pre-wrap to preserve formatting
+                    clone.style.display = 'block'; // must be visible for innerText to work
+                    clone.style.position = 'absolute';
+                    clone.style.opacity = '0';
+                    clone.style.whiteSpace = 'pre-wrap';
+                    
+                    return clone.innerText
                         .replace(/text\\nCopy\\nDownload/g, '')
                         .replace(/Copy|Download/g, '')
                         .trim();
                 } finally {
-                    container.style.whiteSpace = oldStyle;
+                    document.body.removeChild(clone);
                 }
             }
-        """)
-    except Exception:
+        """, timeout=1000)
+    except Exception as e:
+        logger.warning(f"Clean extraction failed: {e}")
         final = last_text
     return final or last_text
-
 
 # ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    return {
+        "status": "running",
+        "models": list(contexts.keys()),
+        "browser": browser_instance is not None
+    }
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     data = await request.json()
@@ -232,53 +452,66 @@ async def chat_completions(request: Request):
     if not backend:
         backend = DEFAULT_MODEL
 
-    cfg = MODEL_CONFIG[backend]
-    page = contexts[backend].pages[0]
+    async with backend_locks[backend]:
+        cfg = MODEL_CONFIG[backend]
+        page = contexts[backend].pages[0]
 
-    messages = data["messages"]
-    # Build the prompt exactly as before (system injection on first turn)
-    system_msg = next((m for m in messages if m["role"] == "system"), None)
-    non_system = [m for m in messages if m["role"] != "system"]
-    turns = sum(1 for m in non_system if m["role"] == "assistant")
+        messages = data["messages"]
+        system_msg = next((m for m in messages if m["role"] == "system"), None)
+        non_system = [m for m in messages if m["role"] != "system"]
+        turns = sum(1 for m in non_system if m["role"] == "assistant")
 
-    pending_images: List[str] = []
-    if turns == 0:
-        user_content = next((m for m in reversed(non_system) if m["role"] == "user"), {})
-        user_text, pending_images = extract_content_parts(user_content.get("content", ""))
-        sys_text = system_msg["content"] if system_msg else ""
-        prompt = f"[SYSTEM CONFIGURATION]\n{sys_text}\n[END]\n\nNow respond to this first request:\n{user_text}"
-    else:
-        # Find last assistant index, send everything after
-        last_ai = -1
-        for i, m in enumerate(messages):
-            if m["role"] == "assistant":
-                last_ai = i
-        new_msgs = messages[last_ai+1:] if last_ai >= 0 else messages
-        parts = []
-        for m in new_msgs:
-            role = m["role"].upper()
-            txt, imgs = extract_content_parts(m.get("content", ""))
-            if imgs:
-                pending_images.extend(imgs)
-            if m.get("role") == "function":
-                parts.append(f"[TOOL RESULT for {m.get('name', 'unknown')}]:\n{txt}\nWhat next?")
-            else:
-                parts.append(f"[{role}]:\n{txt}")
-        prompt = "\n".join(parts)
+        pending_images: List[str] = []
+        if turns == 0:
+            user_content = next((m for m in reversed(non_system) if m["role"] == "user"), {})
+            user_text, pending_images = extract_content_parts(user_content.get("content", ""))
+            sys_text = system_msg["content"] if system_msg else ""
+            prompt = f"[SYSTEM CONFIGURATION]\n{sys_text}\n[END]\n\nNow respond to this first request:\n{user_text}"
+        else:
+            last_ai = -1
+            for i, m in enumerate(messages):
+                if m["role"] == "assistant":
+                    last_ai = i
+            new_msgs = messages[last_ai+1:] if last_ai >= 0 else messages
+            parts = []
+            for m in new_msgs:
+                role = m["role"].upper()
+                txt, imgs = extract_content_parts(m.get("content", ""))
+                if imgs:
+                    pending_images.extend(imgs)
+                if m.get("role") == "function":
+                    parts.append(f"[TOOL RESULT for {m.get('name', 'unknown')}]:\n{txt}\nWhat next?")
+                else:
+                    parts.append(f"[{role}]:\n{txt}")
+            prompt = "\n".join(parts)
 
-    response_text = await get_response(page, cfg, prompt, image_urls=pending_images if pending_images else None)
+        try:
+            response_text = await get_response(page, cfg, prompt, request, image_urls=pending_images if pending_images else None)
+        except RuntimeError as e:
+            logger.error("get_response failed: %s", e)
+            return {
+                "id": "error",
+                "object": "chat.completion",
+                "created": 0,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": f"[Router Error] {e}"},
+                    "finish_reason": "stop"
+                }]
+            }
 
-    return {
-        "id": f"chatcmpl-{abs(hash(response_text))}",
-        "object": "chat.completion",
-        "created": int(asyncio.get_event_loop().time()),
-        "model": model_name,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": response_text},
-            "finish_reason": "stop"
-        }]
-    }
+        return {
+            "id": f"chatcmpl-{abs(hash(response_text))}",
+            "object": "chat.completion",
+            "created": int(asyncio.get_event_loop().time()),
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": response_text},
+                "finish_reason": "stop"
+            }]
+        }
 
 
 @app.get("/v1/current_url")
@@ -304,6 +537,50 @@ async def navigate_to(request: Request):
         return {"status": "error", "message": str(e)}
 
 
+@app.get("/v1/inspect")
+async def inspect_page():
+    """Diagnostic: dump all visible input/editable elements on the current page."""
+    try:
+        page = contexts[DEFAULT_MODEL].pages[0]
+        elements = await page.evaluate("""
+            () => {
+                const results = [];
+                const tags = ['textarea', 'input', '[contenteditable]', 'div[role="textbox"]', 'button', 'div[role="button"]', '.ds-icon-button', '[aria-label]'];
+                tags.forEach(sel => {
+                    document.querySelectorAll(sel).forEach(el => {
+                        const r = el.getBoundingClientRect();
+                        const visible = r.width > 0 && r.height > 0 && window.getComputedStyle(el).display !== 'none';
+                        if (!visible) return;
+                        
+                        // Avoid duplicates
+                        if (el.dataset.inspected) return;
+                        el.dataset.inspected = "true";
+                        
+                        results.push({
+                            tag: el.tagName,
+                            id: el.id || null,
+                            classes: el.className || null,
+                            placeholder: el.placeholder || el.getAttribute('data-placeholder') || null,
+                            aria: el.getAttribute('aria-label') || null,
+                            text: el.innerText ? el.innerText.substring(0, 20) : null,
+                            contenteditable: el.getAttribute('contenteditable'),
+                            visible: visible,
+                            rect: {w: Math.round(r.width), h: Math.round(r.height)}
+                        });
+                    });
+                });
+                return results;
+            }
+        """)
+        return {
+            "url": page.url,
+            "elements": elements
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=HOST, port=PORT)
+

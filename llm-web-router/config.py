@@ -5,13 +5,17 @@ MODEL_CONFIG: Dict[str, dict] = {
     "deepseek": {
         "url": "https://chat.deepseek.com/",
         "profile_dir": "profiles/deepseek",
-        "input_selectors": ["textarea#chat-input", "textarea", "div[contenteditable=\"true\"]"],
+        "input_selectors": [
+            "textarea.ds-scroll-area",
+            "textarea",
+            "div[contenteditable='true']",
+        ],
         "upload_selectors": [
             "input[type=\"file\"][accept*=\"image\"]",
             "input[type=\"file\"][accept*=\"png\"]",
             "input[type=\"file\"]",
         ],
-        "send_selectors": ["button.ds-button--primary", "button[type=\"submit\"]", "div.ds-icon-button"],
+        "send_selectors": ["button.ds-button--primary", "button[type=\"submit\"]"],
         "stop_selector": "div.ds-icon-button svg rect", # Square inside stop button
         "attachment_selector": "div.f02f0e25", # Paperclip button (gets disabled class)
         "response_container": "div.prose, div[class*=\"message\"]",
