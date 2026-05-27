@@ -708,39 +708,58 @@ async def chat_completions(request: Request):
         turns = sum(1 for m in non_system if m["role"] == "assistant")
 
         pending_images: List[str] = []
-        if turns == 0:
-            # For stateless API calls, start a fresh conversation by navigating to the base URL
-            current_url = page.url
-            base_url = cfg["url"]
-            if current_url != base_url and ("/chat" in current_url or "?" in current_url or current_url.rstrip("/") != base_url.rstrip("/")):
-                logger.info("Stateless query detected; resetting page to base URL: %s", base_url)
-                try:
-                    await page.goto(base_url, timeout=15000)
-                    await page.wait_for_load_state("networkidle")
-                    await asyncio.sleep(1)
-                except Exception as e:
-                    logger.warning("Could not reset page to base URL: %s", e)
+        
+        current_url = page.url
+        base_url = cfg["url"]
+        is_fresh_page = (current_url == base_url or current_url.rstrip("/") == base_url.rstrip("/") or "/chat" not in current_url)
 
-            user_content = next((m for m in reversed(non_system) if m["role"] == "user"), {})
-            user_text, pending_images = extract_content_parts(user_content.get("content", ""))
-            sys_text = system_msg["content"] if system_msg else ""
+        if turns == 0 and not is_fresh_page:
+            # For stateless API calls starting a new thread, navigate to base URL
+            logger.info("Stateless query detected; resetting page to base URL: %s", base_url)
+            try:
+                await page.goto(base_url, timeout=15000)
+                await page.wait_for_load_state("networkidle")
+                await asyncio.sleep(1)
+                is_fresh_page = True
+            except Exception as e:
+                logger.warning("Could not reset page to base URL: %s", e)
+
+        # Build master prompt based on selected mode
+        mode = os.environ.get("AGENT_MODE")
+        master_prompt = ""
+        if mode in ("zerobound", "marimo"):
+            try:
+                import sys
+                agent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../lean-agent'))
+                if agent_path not in sys.path:
+                    sys.path.append(agent_path)
+                from agent_brain import build_system_prompt
+                master_prompt = build_system_prompt(os.getcwd(), agent_mode=mode)
+            except Exception as e:
+                logger.error("Failed to load master prompt: %s", e)
+
+        sys_text = system_msg["content"] if system_msg else ""
+        if master_prompt:
+            sys_text = f"{master_prompt}\n\n[USER PROVIDED SYSTEM MESSAGE]\n{sys_text}"
+
+        if is_fresh_page:
+            # We are on a fresh chat page, so we MUST send the entire history + system prompt
+            if turns > 0:
+                logger.info("Stateless replay on fresh page with %d turns", turns)
             
-            # Inject master prompt based on selected mode
-            mode = os.environ.get("AGENT_MODE")
-            if mode in ("zerobound", "marimo"):
-                try:
-                    import sys
-                    agent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../lean-agent'))
-                    if agent_path not in sys.path:
-                        sys.path.append(agent_path)
-                    from agent_brain import build_system_prompt
-                    master_prompt = build_system_prompt(os.getcwd(), agent_mode=mode)
-                    sys_text = f"{master_prompt}\n\n[USER PROVIDED SYSTEM MESSAGE]\n{sys_text}"
-                except Exception as e:
-                    logger.error("Failed to inject master prompt: %s", e)
-
-            prompt = f"[SYSTEM CONFIGURATION]\n{sys_text}\n[END]\n\nNow respond to this first request:\n{user_text}"
+            parts = [f"[SYSTEM CONFIGURATION]\n{sys_text}\n[END]\n\nNow respond to this request:"]
+            for m in non_system:
+                role = m["role"].upper()
+                txt, imgs = extract_content_parts(m.get("content", ""))
+                if imgs:
+                    pending_images.extend(imgs)
+                if m.get("role") == "function":
+                    parts.append(f"[TOOL RESULT for {m.get('name', 'unknown')}]:\n{txt}")
+                else:
+                    parts.append(f"[{role}]:\n{txt}")
+            prompt = "\n\n".join(parts)
         else:
+            # We are continuing an existing chat on the current page, send only delta
             last_ai = -1
             for i, m in enumerate(messages):
                 if m["role"] == "assistant":
@@ -757,6 +776,10 @@ async def chat_completions(request: Request):
                 else:
                     parts.append(f"[{role}]:\n{txt}")
             prompt = "\n".join(parts)
+            
+            # If they just switched mode mid-conversation, prepend it as a reminder
+            if master_prompt and len(parts) > 0 and "SYSTEM CONFIGURATION" not in prompt:
+                prompt = f"[SYSTEM REINFORCEMENT]\n{master_prompt}\n[END]\n\n" + prompt
 
         try:
             response_text = await get_response(page, cfg, prompt, request, image_urls=pending_images if pending_images else None)
