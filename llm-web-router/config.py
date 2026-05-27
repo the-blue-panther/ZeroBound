@@ -36,6 +36,40 @@ MODEL_CONFIG: Dict[str, dict] = {
         "upload_wait_ms": 2000,
         "model_name": "claude-3-5-sonnet",
     },
+    "deepseek-api": {
+        "url": "https://chat.deepseek.com/",
+        "profile_dir": "profiles/deepseek",
+        "input_selectors": [
+            "textarea.ds-scroll-area",
+            "textarea",
+            "div[contenteditable='true']",
+        ],
+        "upload_selectors": [
+            "input[type=\"file\"][accept*=\"image\"]",
+            "input[type=\"file\"][accept*=\"png\"]",
+            "input[type=\"file\"]",
+        ],
+        "send_selectors": ["button.ds-button--primary", "button[type=\"submit\"]"],
+        "stop_selector": "div.ds-icon-button svg rect",
+        "attachment_selector": "div.f02f0e25",
+        "response_container": "div.prose, div[class*=\"message\"]",
+        "upload_wait_ms": 2000,
+        "model_name": ["deepseek-api", "deepseek-marimo"],
+    },
+    "claude-api": {
+        "url": "https://claude.ai/",
+        "profile_dir": "profiles/claude",
+        "input_selectors": ["div[contenteditable=\"true\"]", "textarea"],
+        "upload_selectors": [
+            "input[type=\"file\"][accept*=\"image\"]",
+            "input[type=\"file\"]",
+        ],
+        "send_selectors": ["button[aria-label*=\"Send\"]", "button.ds-button--primary"],
+        "stop_selector": "button[aria-label*=\"Stop\"]",
+        "response_container": "div.prose",
+        "upload_wait_ms": 2000,
+        "model_name": ["claude-api", "claude-marimo"],
+    },
 }
 
 DEFAULT_MODEL = "deepseek"
