@@ -724,6 +724,21 @@ async def chat_completions(request: Request):
             user_content = next((m for m in reversed(non_system) if m["role"] == "user"), {})
             user_text, pending_images = extract_content_parts(user_content.get("content", ""))
             sys_text = system_msg["content"] if system_msg else ""
+            
+            # Inject master prompt based on selected mode
+            mode = os.environ.get("AGENT_MODE")
+            if mode in ("zerobound", "marimo"):
+                try:
+                    import sys
+                    agent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../lean-agent'))
+                    if agent_path not in sys.path:
+                        sys.path.append(agent_path)
+                    from agent_brain import build_system_prompt
+                    master_prompt = build_system_prompt(os.getcwd(), agent_mode=mode)
+                    sys_text = f"{master_prompt}\n\n[USER PROVIDED SYSTEM MESSAGE]\n{sys_text}"
+                except Exception as e:
+                    logger.error("Failed to inject master prompt: %s", e)
+
             prompt = f"[SYSTEM CONFIGURATION]\n{sys_text}\n[END]\n\nNow respond to this first request:\n{user_text}"
         else:
             last_ai = -1
@@ -906,5 +921,26 @@ async def inspect_page():
 
 
 if __name__ == "__main__":
+    print("\n" + "="*50)
+    print("🤖 ZeroBound Web Router Initialization")
+    print("="*50)
+    print("Which mode would you like to run in?")
+    print("  1. ZeroBound (General Engineering Agent)")
+    print("  2. Marimo (Specialized Notebook Agent)")
+    print("  3. Pass-through (No prompt injection)")
+    print("="*50)
+    
+    choice = input("Enter choice (1/2/3) [1]: ").strip()
+    if choice == "2":
+        os.environ["AGENT_MODE"] = "marimo"
+        print("-> Mode set to: MARIMO")
+    elif choice == "3":
+        os.environ["AGENT_MODE"] = "none"
+        print("-> Mode set to: PASS-THROUGH")
+    else:
+        os.environ["AGENT_MODE"] = "zerobound"
+        print("-> Mode set to: ZEROBOUND")
+    print("="*50 + "\n")
+
     import uvicorn
     uvicorn.run(app, host=HOST, port=PORT)
