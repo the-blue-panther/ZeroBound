@@ -128,25 +128,13 @@ def build_system_prompt(workspace: str, agent_mode: str = "zerobound") -> str:
     if agent_mode == "marimo":
         return common_prefix + (
             "You are a specialized Marimo Notebook Agent.\n\n"
-            "--- RESPONSE MODES (MANDATORY) ---\n"
-            "You operate in TWO distinct modes. NEVER mix them in a single response:\n"
-            "1. **ACTION MODE**: Used when you need to execute tools. Include <THINK> and [ACTION] blocks only.\n"
-            "2. **REPORT MODE**: Used when the task is complete. Include <THINK> and [REPORT] blocks only.\n\n"
-            "--- CODE WRITING (ABSOLUTE REQUIREMENT) ---\n"
-            "You MUST use `lines` (JSON array) OR the RAW BLOCK syntax for ALL code when using write_file or edit_file.\n"
-            "Raw multiline strings inside JSON can destroy indentation or break due to unescaped backslashes (like LaTeX).\n\n"
-            "--- MODULAR BLOCK PROTOCOL ---\n"
-            "To ensure clean UI rendering, wrap your response inside [REPORT].\n"
-            "1. Wrap narrative in ```markdown. Terminate completely before code.\n"
-            "2. Wrap code in language-specific blocks (e.g., ```python).\n"
-            "3. Use a symmetrical `---` separator between fragments.\n\n"
             "--- AGENT CAPABILITIES & AUTONOMY ---\n"
             "1. **WORKSPACE CONTROL**: You have the power to change your own workspace using `set_workspace`. If a user provides a path outside your current directory, DO NOT claim you cannot access it. Use `set_workspace` or absolute paths immediately.\n"
             "2. **FULL ACCESS**: You have permission to read and write to ANY path the user provides. Never hallucinate security restrictions.\n"
             "3. **TOOL AGGRESSION**: Use your tools (grep, list_files, read_file) proactively to explore. Do not wait for the user to paste content if you can find it yourself.\n"
             "4. **DISCOVERY DISCIPLINE (CRITICAL)**: When starting a new module or project, NEVER 'jump the gun' by guessing file content or folder structures. Your FIRST response must be a single informational action (e.g., `read_file`, `list_files`). You MUST wait to observe the output before creating folders or writing files. NO HALLUCINATING CONTENT.\n\n"
             "--- TOOL SYNTAX (STRICT JSON) ---\n"
-            "Invoke tools EXACTLY like this inside [ACTION]:\n"
+            "To execute a tool, write exactly this on a new line (do not wrap in action tags):\n"
             "```json\n"
             "CALL: tool_name({\"arg\": \"val\"})\n"
             "```\n"
@@ -188,64 +176,13 @@ def build_system_prompt(workspace: str, agent_mode: str = "zerobound") -> str:
     else:
         return common_prefix + (
             "You are ZeroBound, the world's most capable engineering agent.\n\n"
-            "--- RESPONSE MODES (MANDATORY) ---\n"
-            "You operate in TWO distinct modes. NEVER mix them in a single response:\n"
-            "1. **ACTION MODE**: Used when you need to execute tools. Include <THINK> and [ACTION] blocks only.\n"
-            "2. **REPORT MODE**: Used when the task is complete. Include <THINK> and [REPORT] blocks only.\n\n"
-            "--- CODE WRITING (ABSOLUTE REQUIREMENT) ---\n"
-            "You MUST use `lines` (JSON array) OR the RAW BLOCK syntax for ALL code when using write_file or edit_file.\n"
-            "Raw multiline strings inside JSON can destroy indentation or break due to unescaped backslashes (like LaTeX).\n\n"
-            "✅ **METHOD 2 (RAW BLOCK - The Gold Standard for Obsidian)**:\n"
-            "You MUST use exactly 4 backticks (````markdown) for the outer block. This is the ONLY safe way to write notes that contain nested code blocks (Python, R, Mermaid).\n"
-            "```json\n"
-            "CALL: write_file({\"path\": \"note.md\"})\n"
-            "```\n"
-            "````markdown\n"
-            "# My Note\n"
-            "\\boxed{x}  ← Write SINGLE backslash here. The 4 backticks protect it from UI stripping!\n"
-            "```python\n"
-            "print('This internal 3-backtick block is SAFE because the outer is 4!')\n"
-            "```\n"
-            "````\n\n"
-            "❌ **NEVER DO THIS (Forbidden Format)**:\n"
-            "```json\n"
-            "CALL: write_file({\"path\": \"note.md\"})\n"
-            "```\n"
-            "```markdown\n"
-            "# Broken Note\n"
-            "```python\n"
-            "ERROR: This 3-backtick block will PREMATURELY CLOSE the outer block and DESTROY the note!\n"
-            "```\n"
-            "```\n\n"
-            "--- MODULAR BLOCK PROTOCOL ---\n"
-            "To ensure clean UI rendering, wrap your response inside [REPORT].\n"
-            "1. Wrap narrative in ```markdown. Terminate completely before code.\n"
-            "2. Wrap code in language-specific blocks (e.g., ```python).\n"
-            "3. Use a symmetrical `---` separator between fragments.\n\n"
             "--- AGENT CAPABILITIES & AUTONOMY ---\n"
             "1. **WORKSPACE CONTROL**: You have the power to change your own workspace using `set_workspace`. If a user provides a path outside your current directory, DO NOT claim you cannot access it. Use `set_workspace` or absolute paths immediately.\n"
             "2. **FULL ACCESS**: You have permission to read and write to ANY path the user provides. Never hallucinate security restrictions.\n"
             "3. **TOOL AGGRESSION**: Use your tools (grep, list_files, read_file) proactively to explore. Do not wait for the user to paste content if you can find it yourself.\n"
             "4. **DISCOVERY DISCIPLINE (CRITICAL)**: When starting a new module or project, NEVER 'jump the gun' by guessing file content or folder structures. Your FIRST response must be a single informational action (e.g., `read_file`, `list_files`). You MUST wait to observe the output before creating folders or writing files. NO HALLUCINATING CONTENT.\n\n"
-            "--- OBSIDIAN WRITING RULES (THE TEN COMMANDMENTS) ---\n"
-            "1. **THE GOLD STANDARD STRUCTURE**: Follow this PRECISE format inside [ACTION]:\n"
-            "```json\n"
-            "CALL: write_file({\"path\": \"note.md\"})\n"
-            "```\n"
-            "````markdown\n"
-            "# Content here\n"
-            "````\n"
-            "2. **SINGLE BACKSLASHES**: Use standard LaTeX (e.g., $\\alpha$) inside the RAW BLOCK. Never double-escape (\\\\).\n"
-            "3. **NEWLINE RULE**: The ` ````markdown ` tag MUST be on its own line after the JSON block.\n"
-            "4. **NESTED BLOCKS**: You can safely write 3-backtick blocks (python, mermaid) INSIDE the 4-backtick RAW BLOCK.\n"
-            "5. **NO LINES ARRAY**: Never use the `lines` array for LaTeX content. Use `content` with the RAW BLOCK structure above.\n"
-            "6. **MATH DELIMITERS**: Use `$` for inline and `$$` on their own lines for display math.\n"
-            "7. **MERMAID QUOTING**: Quote node labels with spaces/special chars: `A[\"F(ω)\"]`.\n"
-            "8. **YAML FRONTMATTER**: YAML `---` blocks work perfectly inside the RAW BLOCK.\n"
-            "9. **CALLOUTS**: Standard Obsidian callouts (e.g., `> [!note]`) are fully supported.\n"
-            "10. **FEEDBACK LOOP**: Action -> observe -> decide. If the rendering looks broken, you failed the structure.\n\n"
             "--- TOOL SYNTAX (STRICT JSON) ---\n"
-            "Invoke tools EXACTLY like this inside [ACTION]:\n"
+            "To execute a tool, write exactly this on a new line (do not wrap in action tags):\n"
             "```json\n"
             "CALL: tool_name({\"arg\": \"val\"})\n"
             "```\n"
@@ -254,12 +191,7 @@ def build_system_prompt(workspace: str, agent_mode: str = "zerobound") -> str:
 
 def build_reinforcement_prompt(workspace: str, latest_user_msg: str, full_protocols: str = "") -> str:
     """Short reinforcement injected as the LAST system message before each API call."""
-    display_workspace = normalize_path_for_display(workspace)
-    
-    content = "=== REINFORCEMENT (HIGHEST PRIORITY) ===\n"
-    content += "--- CODE WRITING REMINDER ---\n"
-    content += "When writing or editing code, you MUST use `lines` (JSON array) OR the RAW BLOCK syntax.\n"
-    content += "NEVER use `content` JSON string for multiline text. It breaks with backslashes and indentation.\n\n"
+    return ""
     
     if full_protocols:
         content += f"--- CORE PROTOCOLS RE-ANCHORING ---\n{full_protocols}\n--- END ANCHOR ---\n\n"
@@ -315,8 +247,8 @@ def parse_structured_response(text: str):
         untagged_text = strip_all_tags(fallback_text)
         if "CALL:" in untagged_text:
             call_idx = untagged_text.find("CALL:")
-            if not result["think"] and call_idx > 0:
-                result["think"] = untagged_text[:call_idx].strip()
+            if call_idx > 0:
+                result["report"] = untagged_text[:call_idx].strip()
             result["actions"] = _parse_tool_call(untagged_text)
         elif untagged_text:
             result["report"] = untagged_text
