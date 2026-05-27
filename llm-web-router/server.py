@@ -374,8 +374,9 @@ async def get_markdown_via_copy_button(page: Page) -> Optional[str]:
                 rows.sort((a, b) => b.y - a.y);
                 
                 // The last message's action row will have multiple SVGs (Copy, Regenerate, Good, Bad)
+                // We use >= 3 to avoid accidentally matching a code block's toolbar (which only has Copy/Download)
                 for (const row of rows) {
-                    if (row.items.length >= 2) {
+                    if (row.items.length >= 3) {
                         // Sort left-to-right
                         row.items.sort((a, b) => a.r.left - b.r.left);
                         
@@ -659,6 +660,14 @@ async def get_response(page: Page, cfg: Dict, prompt: str, request: Request, ima
             f.write(await page.content())
     except Exception as e:
         pass
+    try:
+        container_locator = page.locator(cfg["response_container"]).last
+        if await container_locator.count() > 0:
+            await container_locator.hover(timeout=1000)
+            await page.wait_for_timeout(500)
+    except Exception as e:
+        logger.warning(f"Hover before copy button failed: {e}")
+
     markdown = await get_markdown_via_copy_button(page)
     if markdown:
         return markdown
