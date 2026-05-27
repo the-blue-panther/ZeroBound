@@ -47,7 +47,9 @@ class AgentConfig:
         "git_diff", "recall_memory", "get_definition", "get_file_info",
         "get_file_tree", "list_files", "list_running_processes",
         "read_process_output", "read_url", "http_get", "get_env_var",
-        "get_system_info", "is_admin"
+        "get_system_info", "is_admin",
+        # Marimo read-only tools
+        "marimo_get_cell_map", "marimo_get_runtime_data", "marimo_check_notebook", "marimo_validate"
     })
 
 # Configure LiteLLM
@@ -108,7 +110,7 @@ def sanitize_conversation_paths(content: str) -> str:
     return content
 
 # ─── System Prompt ────────────────────────────────────────────────────────────
-PROMPT_VERSION = "2.2.0"
+PROMPT_VERSION = "2.3.0"
 
 def build_system_prompt(workspace: str) -> str:
     """Full system prompt — sent as the first message on every API call."""
@@ -128,39 +130,94 @@ def build_system_prompt(workspace: str) -> str:
         "--- CODE WRITING (ABSOLUTE REQUIREMENT) ---\n"
         "You MUST use `lines` (JSON array) OR the RAW BLOCK syntax for ALL code when using write_file or edit_file.\n"
         "Raw multiline strings inside JSON can destroy indentation or break due to unescaped backslashes (like LaTeX).\n\n"
-        "✅ **METHOD 2 (RAW BLOCK - Best for LaTeX/Markdown/Benglish)**:\n"
+        "✅ **METHOD 2 (RAW BLOCK - The Gold Standard for Obsidian)**:\n"
+        "You MUST use exactly 4 backticks (````markdown) for the outer block. This is the ONLY safe way to write notes that contain nested code blocks (Python, R, Mermaid).\n"
         "```json\n"
         "CALL: write_file({\"path\": \"note.md\"})\n"
         "```\n"
         "````markdown\n"
         "# My Note\n"
         "\\boxed{x}  ← Write SINGLE backslash here. The 4 backticks protect it from UI stripping!\n"
+        "```python\n"
+        "print('This internal 3-backtick block is SAFE because the outer is 4!')\n"
+        "```\n"
         "````\n\n"
+        "❌ **NEVER DO THIS (Forbidden Format)**:\n"
+        "```json\n"
+        "CALL: write_file({\"path\": \"note.md\"})\n"
+        "```\n"
+        "```markdown\n"
+        "# Broken Note\n"
+        "```python\n"
+        "ERROR: This 3-backtick block will PREMATURELY CLOSE the outer block and DESTROY the note!\n"
+        "```\n"
+        "```\n\n"
         "--- MODULAR BLOCK PROTOCOL ---\n"
         "To ensure clean UI rendering, wrap your response inside [REPORT].\n"
         "1. Wrap narrative in ```markdown. Terminate completely before code.\n"
         "2. Wrap code in language-specific blocks (e.g., ```python).\n"
         "3. Use a symmetrical `---` separator between fragments.\n\n"
-        "--- OBSIDIAN WRITING RULES ---\n"
-        "When writing Markdown files for Obsidian, strictly follow these rules:\n"
-        "1. Math Delimiters: Use `$` for inline math and `$$` on their own lines for display math. DO NOT use `\\(` or `\\[`.\n"
-        "2. Mermaid Diagrams: ALWAYS quote node labels that contain spaces, parentheses, or special chars (e.g., `A[\"Frequency Domain F(ω)\"]`). DO NOT use HTML tags.\n"
-        "3. **CRITICAL FOR LATEX**: You MUST use METHOD 2 (RAW BLOCK) and you MUST wrap the content in a 4-backtick ` ````markdown ` block. \n"
-        "4. **NEWLINE RULE**: The ` ````markdown ` tag MUST be on its own line! You MUST press Enter after ` ````markdown `. Do NOT put the title on the same line. If you fail to press Enter, the UI will break and delete all your LaTeX!\n"
-        "5. **NESTED BLOCKS**: Because the outer block uses 4 backticks, you can safely write normal 3-backtick code blocks (e.g., ` ```python `) INSIDE the RAW BLOCK without breaking the UI.\n"
-        "6. Do not double-escape backslashes in the RAW BLOCK. Just write `\\frac`.\n\n"
-        "--- PROTOCOLS ---\n"
-        "1. **FEEDBACK LOOP**: Action -> observe -> decide. NEVER presume success.\n"
-        "2. **VERIFICATION**: Analyze expectations in <THINK> before action, analyze ACTUAL result after.\n"
-        "3. **WINDOWS PATHS**: Favor `D:\\Downloads` over `D:\\s\\` physical paths. The tools handle this automatically.\n"
-        "4. **BATCH READ**: Use `read_files` for speed. Supports PDF, DOCX, XLSX, Images, etc.\n"
-        "5. **INDENTATION (CRITICAL)**: Use `lines` array OR the RAW BLOCK syntax for 100% structural integrity. NEVER flatten indentation!\n\n"
+        "--- AGENT CAPABILITIES & AUTONOMY ---\n"
+        "1. **WORKSPACE CONTROL**: You have the power to change your own workspace using `set_workspace`. If a user provides a path outside your current directory, DO NOT claim you cannot access it. Use `set_workspace` or absolute paths immediately.\n"
+        "2. **FULL ACCESS**: You have permission to read and write to ANY path the user provides. Never hallucinate security restrictions.\n"
+        "3. **TOOL AGGRESSION**: Use your tools (grep, list_files, read_file) proactively to explore. Do not wait for the user to paste content if you can find it yourself.\n"
+        "4. **DISCOVERY DISCIPLINE (CRITICAL)**: When starting a new module or project, NEVER 'jump the gun' by guessing file content or folder structures. Your FIRST response must be a single informational action (e.g., `read_file`, `list_files`). You MUST wait to observe the output before creating folders or writing files. NO HALLUCINATING CONTENT.\n\n"
+        "--- OBSIDIAN WRITING RULES (THE TEN COMMANDMENTS) ---\n"
+        "1. **THE GOLD STANDARD STRUCTURE**: Follow this PRECISE format inside [ACTION]:\n"
+        "```json\n"
+        "CALL: write_file({\"path\": \"note.md\"})\n"
+        "```\n"
+        "````markdown\n"
+        "# Content here\n"
+        "````\n"
+        "2. **SINGLE BACKSLASHES**: Use standard LaTeX (e.g., $\\alpha$) inside the RAW BLOCK. Never double-escape (\\\\).\n"
+        "3. **NEWLINE RULE**: The ` ````markdown ` tag MUST be on its own line after the JSON block.\n"
+        "4. **NESTED BLOCKS**: You can safely write 3-backtick blocks (python, mermaid) INSIDE the 4-backtick RAW BLOCK.\n"
+        "5. **NO LINES ARRAY**: Never use the `lines` array for LaTeX content. Use `content` with the RAW BLOCK structure above.\n"
+        "6. **MATH DELIMITERS**: Use `$` for inline and `$$` on their own lines for display math.\n"
+        "7. **MERMAID QUOTING**: Quote node labels with spaces/special chars: `A[\"F(ω)\"]`.\n"
+        "8. **YAML FRONTMATTER**: YAML `---` blocks work perfectly inside the RAW BLOCK.\n"
+        "9. **CALLOUTS**: Standard Obsidian callouts (e.g., `> [!note]`) are fully supported.\n"
+        "10. **FEEDBACK LOOP**: Action -> observe -> decide. If the rendering looks broken, you failed the structure.\n\n"
         "--- TOOL SYNTAX (STRICT JSON) ---\n"
         "Invoke tools EXACTLY like this inside [ACTION]:\n"
         "```json\n"
         "CALL: tool_name({\"arg\": \"val\"})\n"
         "```\n"
         f"{tools_desc}\n"
+        "\n--- MARIMO NOTEBOOK AGENT (READ THIS WHEN WORKING ON .py NOTEBOOKS) ---\n"
+        "Marimo notebooks are pure Python scripts where each @app.cell decorated function is an isolated reactive cell.\n"
+        "The notebook runs as a strict DAG — violating these rules WILL break the notebook:\n\n"
+        "🔴 LAW 1 — NO DUPLICATE GLOBALS: A variable name may ONLY be defined (assigned) in ONE cell. "
+        "If 'df' is defined in cell A, no other cell may define 'df'. Always call `marimo_get_cell_map` first to audit existing names.\n\n"
+        "🔴 LAW 2 — NO HIDDEN STATE: There is no execution order magic. If Cell B references 'df', it automatically "
+        "re-runs whenever 'df' changes in Cell A. Design cells modularly — one logical unit per cell.\n\n"
+        "🔴 LAW 3 — FUNCTION-SCOPED: All cell code runs inside a function body. Do NOT use top-level statements "
+        "like `if __name__ == '__main__'` inside cells. Imports are fine at cell-function scope.\n\n"
+        "🟡 LAW 4 — RETURN LAST EXPRESSION: A cell's output is its last expression. To display multiple items, "
+        "return `mo.vstack([item1, item2])`. Never use `print()` for display — use `mo.md()` or `mo.vstack()`.\n\n"
+        "--- MARIMO OPERATIONAL LOOP (MANDATORY) ---\n"
+        "When the user asks you to create or modify a Marimo notebook, you MUST follow this sequence:\n"
+        "  STEP 1 DISCOVER — Call `marimo_get_cell_map(notebook_path)` to see all cells and their globals.\n"
+        "  STEP 2 PLAN — Identify which cell to update or where to add a new cell. Check that no variable name\n"
+        "                 you intend to define is already globally allocated in another cell.\n"
+        "  STEP 3 MUTATE — Call `marimo_update_cell` (to edit) or `marimo_add_cell` (to inject new cell).\n"
+        "                   Use `new_code` as the raw Python body (no function def, no decorator).\n"
+        "  STEP 4 VALIDATE — Call `marimo_validate(notebook_path)` to check for duplicate variable definitions.\n"
+        "                     Then call `marimo_check_notebook(notebook_path)` for syntax + circular dep check.\n"
+        "  STEP 5 CONFIRM — If validation passes, report success. If not, trace the conflict and fix it.\n\n"
+        "--- MARIMO UI PATTERNS ---\n"
+        "• Use `mo.ui.slider()`, `mo.ui.dropdown()`, `mo.ui.text()`, `mo.ui.table()` for reactive inputs.\n"
+        "• Bind UI elements to variables: `value = slider.value` (in the SAME cell as the slider).\n"
+        "• Layout: `mo.vstack([...])` for vertical, `mo.hstack([...])` for horizontal, `mo.accordion({...})` for collapsible sections.\n"
+        "• Use `mo.md('# Title\\n**Bold**')` for rich markdown output in cells.\n"
+        "• For custom micro-frontends: use `anywidget` — import and return the widget as the cell's last expression.\n"
+        "• Prefer `polars` over `pandas`, `altair` over `matplotlib` for reactive, declarative visualizations.\n"
+        "• When building dashboards, wrap the final layout in a single display cell: `return mo.vstack([header, chart, table])`.\n\n"
+        "--- MARIMO WATCH MODE (CLI INTEGRATION) ---\n"
+        "If the user has Marimo running with `marimo edit notebook.py --watch`, any file change you make via\n"
+        "`marimo_update_cell` or `marimo_add_cell` instantly hot-reloads in their browser. You do NOT need to\n"
+        "restart Marimo. After editing, call `marimo_check_notebook` to verify there are no errors.\n"
     )
 
 def build_reinforcement_prompt(workspace: str, latest_user_msg: str, full_protocols: str = "") -> str:
@@ -180,8 +237,8 @@ def build_reinforcement_prompt(workspace: str, latest_user_msg: str, full_protoc
         f"User's LATEST instruction: \"{latest_user_msg[:1000]}\"\n"
         "^^^ THIS is what you must accomplish. Previous goals are superseded.\n\n"
         "FORMAT REMINDER: You MUST respond with a <THINK> block followed by an [ACTION] block or [REPORT] block.\n"
-        "Ensure you use proper MULTILINE formatting for your tags and code blocks.\n"
-        "CODE REMINDER: Use `lines` or RAW BLOCK syntax for ALL write_file and edit_file operations."
+        "OBSIDIAN GOLD STANDARD: Use `content` + **4-backtick RAW BLOCK** for ALL math-heavy notes. No `lines` for LaTeX!\n"
+        "DISCOVERY DISCIPLINE: READ files before creating folders or writing. NEVER 'jump the gun' by guessing content."
     )
     return content
 
@@ -190,7 +247,7 @@ def build_reinforcement_prompt(workspace: str, latest_user_msg: str, full_protoc
 def strip_all_tags(text: str) -> str:
     """Aggressively removes all known agent tags from text."""
     if not text: return ""
-    return re.sub(r'</?THINK>|\[/?(?:ACTION|REPORT)\]', '', text, flags=re.IGNORECASE).strip()
+    return re.sub(r'</?THINK>|[\[<]/?(?:ACTION|REPORT)[\]>]', '', text, flags=re.IGNORECASE).strip()
 
 def parse_structured_response(text: str):
     """Parse the LLM's response into think/action/report components."""
@@ -198,19 +255,21 @@ def parse_structured_response(text: str):
     if not text: return result
 
     # 1. Extract <THINK> block
+    fallback_text = text
     think_match = re.search(r'<THINK>(.*?)</THINK>', text, re.DOTALL | re.IGNORECASE)
     if not think_match:
         think_match = re.search(r'<THINK>(.*)', text, re.DOTALL | re.IGNORECASE)
     if think_match:
         result["think"] = strip_all_tags(think_match.group(1).strip())
+        fallback_text = text[:think_match.start()] + text[think_match.end():]
 
-    # 2. Extract <REPORT> block
-    report_match = re.search(r'\[REPORT\](.*?)(?:\[/REPORT\]|$)', text, re.DOTALL | re.IGNORECASE)
+    # 2. Extract [REPORT] or <REPORT> block
+    report_match = re.search(r'(?:\[REPORT\]|<REPORT>)(.*?)(?:\[/REPORT\]|</REPORT>|$)', text, re.DOTALL | re.IGNORECASE)
     if report_match:
         result["report"] = strip_all_tags(report_match.group(1).strip())
 
-    # 3. Extract <ACTION> blocks
-    action_matches = re.finditer(r'\[ACTION\](.*?)(?:\[/ACTION\]|$)', text, re.DOTALL | re.IGNORECASE)
+    # 3. Extract [ACTION] or <ACTION> blocks
+    action_matches = re.finditer(r'(?:\[ACTION\]|<ACTION>)(.*?)(?:\[/ACTION\]|</ACTION>|$)', text, re.DOTALL | re.IGNORECASE)
     actions = []
     for match in action_matches:
         action_text = match.group(1).strip()
@@ -221,7 +280,7 @@ def parse_structured_response(text: str):
 
     # 4. Fallback: handle untagged CALL:
     if not result["report"] and not result["actions"]:
-        untagged_text = strip_all_tags(text)
+        untagged_text = strip_all_tags(fallback_text)
         if "CALL:" in untagged_text:
             call_idx = untagged_text.find("CALL:")
             if not result["think"] and call_idx > 0:
@@ -234,14 +293,30 @@ def parse_structured_response(text: str):
 def _extract_raw_content(text: str) -> str:
     """Extract content from backticked blocks or naked text."""
     if not text: return ""
+    # Case 1: Complete fenced block  ````markdown\n...\n```` (backreference match)
     block_match = re.search(r'^(`{3,})[a-zA-Z0-9_]*\n(.*)\1$', text, re.DOTALL | re.IGNORECASE)
     if block_match: return block_match.group(2).strip()
+    # Case 2: Opening fence only (may be missing closing fence)
     match_open = re.search(r'^(`{3,})[a-zA-Z0-9_]*\n', text)
     if match_open:
         ticks = match_open.group(1)
         content = text[match_open.end():].strip()
         if content.endswith(ticks): content = content[:-len(ticks)].strip()
         return content
+    # Case 3: Bare language identifier as first line (e.g. the LLM forgot the backtick fence).
+    # Strip it so that words like 'markdown', 'python', 'json' etc. are not written into files.
+    bare_lang_match = re.match(r'^([a-zA-Z][a-zA-Z0-9_]*)\n', text)
+    if bare_lang_match:
+        lang = bare_lang_match.group(1).lower()
+        # Only strip recognised language / format names, not real content words
+        KNOWN_LANGS = {
+            'markdown', 'md', 'python', 'py', 'javascript', 'js', 'typescript', 'ts',
+            'json', 'yaml', 'yml', 'html', 'css', 'bash', 'sh', 'text', 'txt',
+            'sql', 'xml', 'toml', 'ini', 'java', 'cpp', 'c', 'rust', 'go', 'ruby',
+            'php', 'swift', 'kotlin', 'r', 'scala', 'perl', 'lua', 'dart',
+        }
+        if lang in KNOWN_LANGS:
+            return text[bare_lang_match.end():].strip()
     return text
 
 def _tool_supports_param(tool_name: str, param: str) -> bool:
@@ -279,7 +354,17 @@ def _parse_tool_call(text: str) -> List[Dict[str, Any]]:
             
         if tool_name and call_end != -1:
             remaining = chunk[call_end:].strip()
-            remaining = re.sub(r'^\s*```\s*\n', '', remaining).strip()
+            # Clean up fences from remaining content.
+            # We split remaining into lines and locate all fence lines starting with 3+ backticks.
+            # If the first line is a fence, we strip it if and only if it's NOT the opening fence of a single fenced block.
+            # A single fenced block is characterized by having exactly 2 fences (one at the start, one at the end).
+            if remaining:
+                lines = remaining.split('\n')
+                fence_indices = [idx for idx, line in enumerate(lines) if re.match(r'^\s*`{3,}', line)]
+                if fence_indices and fence_indices[0] == 0:
+                    is_single_fenced_block = (len(fence_indices) == 2 and fence_indices[-1] == len(lines) - 1)
+                    if not is_single_fenced_block:
+                        remaining = '\n'.join(lines[1:]).strip()
             
             if remaining:
                 supp_c = _tool_supports_param(tool_name, "content")
@@ -381,6 +466,71 @@ def trim_conversation(messages: List[Dict], max_messages: int = 40) -> List[Dict
     summary_msg = {"role": "system", "content": f"[Smart Trim: {len(convo_msgs)-len(preserved)} messages compressed.]"}
     return system_msgs + [summary_msg] + preserved
 
+def validate_tool_args(tool_name: str, args: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """Validate tool arguments against the schemas defined in TOOLS."""
+    tool_schema = None
+    for t in TOOLS:
+        if t["name"] == tool_name:
+            tool_schema = t
+            break
+            
+    # Custom fallback for browser commands that aren't statically defined in TOOLS
+    if not tool_schema and tool_name.startswith("browser_"):
+        cmd = tool_name.split("_", 1)[1]
+        if cmd == "goto":
+            required = ["url"]
+            properties = {"url": {"type": "string"}}
+        elif cmd == "click":
+            required = ["selector"]
+            properties = {"selector": {"type": "string"}}
+        elif cmd == "type":
+            required = ["selector", "text"]
+            properties = {"selector": {"type": "string"}, "text": {"type": "string"}}
+        elif cmd in ["scroll", "screenshot", "close"]:
+            required = []
+            properties = {}
+        else:
+            return False, f"Unknown browser command: browser_{cmd}"
+        
+        tool_schema = {
+            "name": tool_name,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required
+            }
+        }
+        
+    if not tool_schema:
+        return False, f"Tool '{tool_name}' is not registered in the Tool Registry."
+        
+    parameters = tool_schema.get("parameters", {})
+    if not parameters:
+        return True, None
+        
+    # Check required fields
+    required_fields = parameters.get("required", [])
+    for field in required_fields:
+        if field not in args:
+            return False, f"Missing required parameter '{field}' for tool '{tool_name}'."
+            
+    # Check types
+    properties = parameters.get("properties", {})
+    for key, val in args.items():
+        if key not in properties:
+            continue
+        expected_type = properties[key].get("type")
+        if expected_type == "string" and not isinstance(val, str):
+            return False, f"Parameter '{key}' must be a string, got {type(val).__name__}."
+        elif expected_type == "integer" and not isinstance(val, (int, float)):
+            return False, f"Parameter '{key}' must be an integer, got {type(val).__name__}."
+        elif expected_type == "boolean" and not isinstance(val, bool):
+            return False, f"Parameter '{key}' must be a boolean, got {type(val).__name__}."
+        elif expected_type == "array" and not isinstance(val, list):
+            return False, f"Parameter '{key}' must be an array (list), got {type(val).__name__}."
+            
+    return True, None
+
 # ─── Main Agent ──────────────────────────────────────────────────────────────
 
 class LeanAgent:
@@ -478,7 +628,7 @@ class LeanAgent:
                 
                 if callback: await callback({"type": "final_response", "content": res})
                 return res
-            action_matches = list(re.finditer(r'\[/ACTION\]', content, re.IGNORECASE))
+            action_matches = list(re.finditer(r'(?:\[/ACTION\]|</ACTION>)', content, re.IGNORECASE))
             if action_matches:
                 truncated = content[:action_matches[-1].end()]
                 # Find and update the latest assistant message that contains an ACTION
@@ -486,7 +636,7 @@ class LeanAgent:
                     msg_obj = self.messages[i]
                     if msg_obj.get("role") == "assistant":
                         msg_content = msg_obj.get("content") or ""
-                        if "[ACTION]" in msg_content:
+                        if "[ACTION]" in msg_content or "<ACTION>" in msg_content:
                             msg_obj["content"] = truncated
                             break
             await self._execute_tool_calls(parsed["actions"], callback)
@@ -510,6 +660,16 @@ class LeanAgent:
             pending_reads.clear()
         for action in actions:
             t_name, t_args = action["tool"], action["args"]
+            
+            # Validation Gate
+            valid, err_msg = validate_tool_args(t_name, t_args)
+            if not valid:
+                validation_res = {"error": "SchemaValidationError", "message": err_msg}
+                if callback:
+                    await callback({"type": "direct_terminal_result", "stdout": f"❌ Tool Validation Failed: {err_msg}\n", "agent_controlled": True})
+                self._store_result(t_name, validation_res)
+                continue
+                
             from tool_registry import requires_approval
             if requires_approval(t_name, t_args):
                 await flush_reads()

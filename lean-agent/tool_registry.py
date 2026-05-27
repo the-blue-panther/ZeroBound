@@ -72,6 +72,39 @@ try:
 except ImportError:
     pass
 
+# ─── Verification & Output Formatting Helpers ─────────────────────────────────
+
+def truncate_stdout(stdout_str: str, max_lines: int = 300) -> str:
+    """Truncate stdout to first N and last N lines if it exceeds max_lines."""
+    if not stdout_str:
+        return ""
+    lines = stdout_str.splitlines(keepends=True)
+    if len(lines) <= max_lines:
+        return stdout_str
+    half = max_lines // 2
+    first_part = "".join(lines[:half])
+    last_part = "".join(lines[-half:])
+    excess = len(lines) - max_lines
+    return f"{first_part}\n... [TRUNCATED {excess} LINES OF OUTPUT FOR CONTEXT SANITY] ...\n\n{last_part}"
+
+def check_python_syntax(content: str) -> Optional[str]:
+    """Built-in AST compilation check for Python scripts."""
+    try:
+        compile(content, "<string>", "exec")
+        return None
+    except SyntaxError as e:
+        return f"Python SyntaxError on line {e.lineno}: {e.msg}\nCode snippet:\n{e.text}"
+    except Exception as e:
+        return f"Syntax compilation check failed: {e}"
+
+def check_json_syntax(content: str) -> Optional[str]:
+    """JSON validation check."""
+    try:
+        json.loads(content)
+        return None
+    except json.JSONDecodeError as e:
+        return f"JSON DecodeError: {e.msg} at line {e.lineno}, column {e.colno}"
+
 # ---------------------------------------------------------------------------
 # Globals & workspace
 # ---------------------------------------------------------------------------
@@ -603,6 +636,25 @@ def write_file(path: str, content: str = "", lines: Optional[List[str]] = None,
         content = "\n".join(lines)
     elif lines is not None:
         content = "\n".join(lines)
+
+    # Built-in syntax check validation guards before writing
+    if path.lower().endswith(".py"):
+        syntax_err = check_python_syntax(content)
+        if syntax_err:
+            return {
+                "error": "Python syntax validation failed before writing.",
+                "details": syntax_err,
+                "hint": "Please review your code structure, indentation, or statements, and rewrite a valid script."
+            }
+    elif path.lower().endswith(".json"):
+        syntax_err = check_json_syntax(content)
+        if syntax_err:
+            return {
+                "error": "JSON validation failed before writing.",
+                "details": syntax_err,
+                "hint": "Please verify your braces, commas, and double-quotes to ensure standard JSON compliance."
+            }
+
     full = _get_operation_path(path)
     try:
         os.makedirs(os.path.dirname(full), exist_ok=True)
@@ -646,54 +698,78 @@ def edit_file(path: str, target: str = "", replacement: str = "",
     with open(full, "r", encoding="utf-8") as f:
         original = f.read()
 
+    new_content = None
+    match_type = None
+
     # Stage 1: exact match
     if original.count(target) == 1:
-        new = original.replace(target, replacement, 1)
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(new)
-        _file_cache.pop(full, None)
-        return {"status": "success", "match_type": "exact"}
+        new_content = original.replace(target, replacement, 1)
+        match_type = "exact"
 
-    # Stage 2: whitespace‑agnostic regex
-    target_lines = [l.strip() for l in target.splitlines() if l.strip()]
-    if not target_lines:
-        return {"error": "Target is empty or whitespace only."}
-    escaped = [re.escape(l) for l in target_lines]
-    pattern = r'[ \t]*' + r'\s+'.join(escaped) + r'[ \t]*'
-    matches = list(re.finditer(pattern, original, re.MULTILINE))
-    if len(matches) == 1:
-        new = original.replace(matches[0].group(0), replacement, 1)
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(new)
-        _file_cache.pop(full, None)
-        return {"status": "success", "match_type": "fuzzy_regex"}
-
-    if len(matches) > 1:
-        return {"error": f"Found {len(matches)} fuzzy matches. Provide more context."}
+    # Stage 2: whitespace-agnostic regex
+    if new_content is None:
+        target_lines = [l.strip() for l in target.splitlines() if l.strip()]
+        if not target_lines:
+            return {"error": "Target is empty or whitespace only."}
+        escaped = [re.escape(l) for l in target_lines]
+        pattern = r'[ \t]*' + r'\s+'.join(escaped) + r'[ \t]*'
+        matches = list(re.finditer(pattern, original, re.MULTILINE))
+        if len(matches) == 1:
+            new_content = original.replace(matches[0].group(0), replacement, 1)
+            match_type = "fuzzy_regex"
+        elif len(matches) > 1:
+            return {"error": f"Found {len(matches)} fuzzy matches. Provide more context."}
 
     # Stage 3: first & last line anchor
-    first_line, last_line = target_lines[0], target_lines[-1]
-    candidate = None
-    for i, line in enumerate(original.splitlines()):
-        if line.strip() == first_line:
-            for j in range(i, min(i + len(target_lines) + 10, len(original.splitlines()))):
-                if original.splitlines()[j].strip() == last_line:
-                    if candidate is None:
-                        candidate = (i, j)
-                    else:
-                        return {"error": "Multiple anchor matches found."}
-    if candidate:
-        start_idx, end_idx = candidate
-        lines = original.splitlines()
-        new_lines = lines[:start_idx] + [replacement] + lines[end_idx+1:]
-        new_content = "\n".join(new_lines)
-        if original.endswith("\n") and not new_content.endswith("\n"):
-            new_content += "\n"
+    if new_content is None:
+        first_line, last_line = target_lines[0], target_lines[-1]
+        candidate = None
+        for i, line in enumerate(original.splitlines()):
+            if line.strip() == first_line:
+                for j in range(i, min(i + len(target_lines) + 10, len(original.splitlines()))):
+                    if original.splitlines()[j].strip() == last_line:
+                        if candidate is None:
+                            candidate = (i, j)
+                        else:
+                            return {"error": "Multiple anchor matches found."}
+        if candidate:
+            start_idx, end_idx = candidate
+            lines = original.splitlines()
+            new_lines = lines[:start_idx] + [replacement] + lines[end_idx+1:]
+            new_content = "\n".join(new_lines)
+            if original.endswith("\n") and not new_content.endswith("\n"):
+                new_content += "\n"
+            match_type = "anchor"
+
+    if new_content is None:
+        return {"error": "Target not found."}
+
+    # Built-in syntax check guards for the edited file
+    if path.lower().endswith(".py"):
+        syntax_err = check_python_syntax(new_content)
+        if syntax_err:
+            return {
+                "error": "Python syntax validation failed after applying this edit. Edit aborted.",
+                "details": syntax_err,
+                "hint": "Please review the replacement content, indentation, and structure to ensure it remains a valid script."
+            }
+    elif path.lower().endswith(".json"):
+        syntax_err = check_json_syntax(new_content)
+        if syntax_err:
+            return {
+                "error": "JSON validation failed after applying this edit. Edit aborted.",
+                "details": syntax_err,
+                "hint": "Please check your braces, commas, or quotes in the replacement content to keep standard JSON compatibility."
+            }
+
+    # Write the validated new content
+    try:
         with open(full, "w", encoding="utf-8") as f:
             f.write(new_content)
         _file_cache.pop(full, None)
-        return {"status": "success", "match_type": "anchor"}
-    return {"error": "Target not found."}
+        return {"status": "success", "match_type": match_type}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def append_file(path: str, content: str = "", lines: Optional[List[str]] = None,
@@ -963,8 +1039,8 @@ async def run_command_async(command: str, callback: Optional[Callable] = None) -
                     if not chunk:
                         break
                     decoded = chunk.decode("utf-8", errors="replace")
+                    active_processes[temp_id]["buffer"].append(decoded)
                     if is_stderr:
-                        active_processes[temp_id]["buffer"].append(decoded)
                         if callback:
                             asyncio.run_coroutine_threadsafe(
                                 callback({"type": "direct_terminal_result", "stderr": decoded, "agent_controlled": True}),
@@ -990,8 +1066,10 @@ async def run_command_async(command: str, callback: Optional[Callable] = None) -
                 return {"error": "Command timed out after 15 seconds. Use start_background_command for long‑running tasks."}
 
             t1.join(); t2.join()
+            raw_stdout = "".join(active_processes[temp_id]["buffer"])
             active_processes.pop(temp_id, None)
-            return {"stdout": "".join(active_processes[temp_id]["buffer"]), "stderr": "", "code": proc.returncode}
+            truncated_stdout = truncate_stdout(raw_stdout, max_lines=300)
+            return {"stdout": truncated_stdout, "stderr": "", "code": proc.returncode}
         except Exception as e:
             return {"error": str(e)}
 
@@ -1041,10 +1119,11 @@ def read_process_output(process_id: str) -> Dict[str, Any]:
     proc = info["process"]
     out = "".join(info["buffer"])
     info["buffer"].clear()
+    truncated_out = truncate_stdout(out, max_lines=300)
     status = "running" if proc.poll() is None else f"exited with code {proc.poll()}"
     if status != "running":
         del active_processes[process_id]
-    return {"process_id": process_id, "status": status, "output": out or "(no new output)"}
+    return {"process_id": process_id, "status": status, "output": truncated_out or "(no new output)"}
 
 
 def kill_process(process_id: str) -> Dict[str, Any]:
@@ -1619,6 +1698,261 @@ def create_requirements(path: str = ".", output: str = "requirements.txt") -> Di
 
 
 # ---------------------------------------------------------------------------
+# Marimo notebook tools
+# ---------------------------------------------------------------------------
+
+def marimo_get_cell_map(notebook_path: str) -> Dict[str, Any]:
+    """
+    Parse a Marimo .py notebook and return a lightweight map of all cells.
+    Returns cell index, first line preview, and approximate line range.
+    This is the primary discovery tool — always call this before editing.
+    """
+    path = _get_operation_path(notebook_path)
+    if not os.path.exists(path):
+        return {"error": f"Notebook not found: {notebook_path}"}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            source = f.read()
+        # Marimo cells are decorated with @app.cell or @app.cell(hide_code=True)
+        import ast
+        tree = ast.parse(source)
+        cells = []
+        lines = source.splitlines()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                for decorator in node.decorator_list:
+                    dec_src = ast.unparse(decorator) if hasattr(ast, 'unparse') else ""
+                    if 'cell' in dec_src or 'app.cell' in dec_src:
+                        body_lines = lines[node.body[0].lineno - 1 : node.end_lineno]
+                        preview = body_lines[0].strip()[:80] if body_lines else ""
+                        cells.append({
+                            "index": len(cells),
+                            "name": node.name,
+                            "line_start": node.lineno,
+                            "line_end": node.end_lineno,
+                            "preview": preview,
+                            "decorator": dec_src
+                        })
+        return {
+            "notebook": notebook_path,
+            "cell_count": len(cells),
+            "cells": cells
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def marimo_get_runtime_data(marimo_server_url: str = "http://localhost:2718") -> Dict[str, Any]:
+    """
+    Query a running Marimo server for live runtime state:
+    variable values, cell statuses (idle/running/error), and stdout.
+    Marimo must be running with: marimo edit notebook.py
+    """
+    try:
+        import urllib.request
+        import json as json_mod
+        req = urllib.request.Request(
+            f"{marimo_server_url.rstrip('/')}/api/kernel/status",
+            headers={"Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json_mod.loads(resp.read().decode())
+        return {"status": "ok", "runtime": data}
+    except Exception as e:
+        return {
+            "status": "unavailable",
+            "hint": "Start Marimo with: marimo edit notebook.py. Then retry.",
+            "error": str(e)
+        }
+
+
+def marimo_update_cell(notebook_path: str, cell_name: str, new_code: str) -> Dict[str, Any]:
+    """
+    Replace the body of a named Marimo cell in the notebook .py file.
+    The cell is identified by its function name (from marimo_get_cell_map).
+    If Marimo is running with --watch, changes apply instantly in the browser.
+    Uses the same safe edit_file fuzzy-match logic internally.
+    """
+    path = _get_operation_path(notebook_path)
+    if not os.path.exists(path):
+        return {"error": f"Notebook not found: {notebook_path}"}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            source = f.read()
+        import ast
+        tree = ast.parse(source)
+        lines = source.splitlines(keepends=True)
+        target_node = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == cell_name:
+                for dec in node.decorator_list:
+                    dec_src = ast.unparse(dec) if hasattr(ast, 'unparse') else ""
+                    if 'cell' in dec_src:
+                        target_node = node
+                        break
+            if target_node:
+                break
+        if not target_node:
+            return {"error": f"Cell '{cell_name}' not found in {notebook_path}"}
+        # Preserve function signature and decorator; replace only the body
+        body_start = target_node.body[0].lineno - 1   # 0-indexed
+        body_end = target_node.end_lineno              # inclusive
+        # Detect indentation from first body line
+        indent = ""
+        first_body_line = lines[body_start] if body_start < len(lines) else ""
+        for ch in first_body_line:
+            if ch in (" ", "\t"): indent += ch
+            else: break
+        # Indent the new code body
+        new_body_lines = [(indent + l if l.strip() else l) for l in new_code.splitlines()]
+        new_lines = lines[:body_start] + [l + "\n" for l in new_body_lines] + lines[body_end:]
+        new_source = "".join(new_lines)
+        # Validate syntax before writing
+        syntax_err = check_python_syntax(new_source)
+        if syntax_err:
+            return {"error": "Syntax error in new_code", "details": syntax_err}
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_source)
+        _file_cache.pop(path, None)
+        return {"status": "success", "cell": cell_name, "notebook": notebook_path}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def marimo_add_cell(notebook_path: str, code: str, after_cell: str = None, hide_code: bool = False) -> Dict[str, Any]:
+    """
+    Inject a new Marimo cell into the notebook .py file.
+    Inserts after the specified cell (by name), or appends at the end.
+    The cell is given an auto-generated unique name.
+    If Marimo is running with --watch, the new cell appears live in the browser.
+    """
+    path = _get_operation_path(notebook_path)
+    if not os.path.exists(path):
+        return {"error": f"Notebook not found: {notebook_path}"}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            source = f.read()
+        import ast, uuid as _uuid
+        cell_name = "_cell_" + _uuid.uuid4().hex[:8]
+        decorator = "@app.cell(hide_code=True)" if hide_code else "@app.cell"
+        indent = "    "  # Marimo uses 4-space indent inside cells
+        indented_code = "\n".join(indent + l if l.strip() else "" for l in code.splitlines())
+        new_cell = f"\n\n{decorator}\ndef {cell_name}():\n{indented_code}\n"
+        if after_cell:
+            tree = ast.parse(source)
+            lines = source.splitlines(keepends=True)
+            insert_line = None
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name == after_cell:
+                    for dec in node.decorator_list:
+                        dec_src = ast.unparse(dec) if hasattr(ast, 'unparse') else ""
+                        if 'cell' in dec_src:
+                            insert_line = node.end_lineno  # 1-indexed
+                            break
+            if insert_line is None:
+                return {"error": f"Cell '{after_cell}' not found; cannot insert after it."}
+            new_lines = lines[:insert_line] + [new_cell] + lines[insert_line:]
+            new_source = "".join(new_lines)
+        else:
+            # Append before the final `app.run()` call if present, else at end
+            if "app.run()" in source:
+                new_source = source.replace("app.run()", new_cell + "\napp.run()")
+            else:
+                new_source = source + new_cell
+        syntax_err = check_python_syntax(new_source)
+        if syntax_err:
+            return {"error": "Syntax error in new cell code", "details": syntax_err}
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_source)
+        _file_cache.pop(path, None)
+        return {"status": "success", "new_cell_name": cell_name, "notebook": notebook_path}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def marimo_check_notebook(notebook_path: str) -> Dict[str, Any]:
+    """
+    Validate a Marimo notebook for syntax and circular dependency errors
+    without running it. Equivalent to: marimo check notebook.py
+    Returns any errors found so the agent can self-correct.
+    """
+    path = _get_operation_path(notebook_path)
+    if not os.path.exists(path):
+        return {"error": f"Notebook not found: {notebook_path}"}
+    # 1. Python syntax check
+    with open(path, "r", encoding="utf-8") as f:
+        source = f.read()
+    syntax_err = check_python_syntax(source)
+    if syntax_err:
+        return {"valid": False, "error_type": "syntax", "details": syntax_err}
+    # 2. Try running 'marimo check' via CLI if available
+    try:
+        result = subprocess.run(
+            ["marimo", "check", path],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return {
+                "valid": False,
+                "error_type": "marimo_check",
+                "stdout": result.stdout,
+                "stderr": result.stderr
+            }
+        return {"valid": True, "message": result.stdout or "No errors found."}
+    except FileNotFoundError:
+        return {
+            "valid": None,
+            "warning": "'marimo' CLI not found in PATH. Only Python syntax was checked.",
+            "python_syntax": "ok"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def marimo_validate(notebook_path: str) -> Dict[str, Any]:
+    """
+    Extended validation: checks for duplicate global variable definitions across cells,
+    which would cause Marimo's DAG to break. Returns the list of conflicts found.
+    Always run this after adding or updating cells that define new variables.
+    """
+    path = _get_operation_path(notebook_path)
+    if not os.path.exists(path):
+        return {"error": f"Notebook not found: {notebook_path}"}
+    try:
+        import ast
+        with open(path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source)
+        # Track variable definitions per cell
+        cell_defs: Dict[str, list] = {}  # var_name -> [cell_names]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                for dec in node.decorator_list:
+                    dec_src = ast.unparse(dec) if hasattr(ast, 'unparse') else ""
+                    if 'cell' in dec_src:
+                        # Find all top-level assignments in the cell body
+                        for stmt in node.body:
+                            if isinstance(stmt, ast.Assign):
+                                for target in stmt.targets:
+                                    if isinstance(target, ast.Name):
+                                        cell_defs.setdefault(target.id, []).append(node.name)
+                            elif isinstance(stmt, (ast.AnnAssign,)):
+                                if isinstance(stmt.target, ast.Name):
+                                    cell_defs.setdefault(stmt.target.id, []).append(node.name)
+        # Find conflicts (same var defined in >1 cell)
+        conflicts = {var: cells for var, cells in cell_defs.items() if len(cells) > 1}
+        if conflicts:
+            return {
+                "valid": False,
+                "conflicts": conflicts,
+                "hint": "Each global variable must be defined in exactly ONE cell. Merge or rename duplicates."
+            }
+        return {"valid": True, "message": f"No duplicate variable definitions found. {len(cell_defs)} globals checked."}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # Tool dispatcher
 # ---------------------------------------------------------------------------
 TOOL_MAP = {
@@ -1685,6 +2019,13 @@ TOOL_MAP = {
     "plot_save": (plot_save, False),
     "run_notebook": (run_notebook, False),
     "create_requirements": (create_requirements, False),
+    # Marimo notebook tools
+    "marimo_get_cell_map": (marimo_get_cell_map, False),
+    "marimo_get_runtime_data": (marimo_get_runtime_data, False),
+    "marimo_update_cell": (marimo_update_cell, False),
+    "marimo_add_cell": (marimo_add_cell, False),
+    "marimo_check_notebook": (marimo_check_notebook, False),
+    "marimo_validate": (marimo_validate, False),
 }
 
 
@@ -2340,6 +2681,76 @@ TOOLS = [
                 "path": {"type": "string", "default": "."},
                 "output": {"type": "string", "default": "requirements.txt"}
             }
+        }
+    },
+    {
+        "name": "marimo_get_cell_map",
+        "description": "Parse a Marimo .py notebook and return a lightweight map of all cells (name, line range, preview). ALWAYS call this first before editing any Marimo notebook to discover existing definitions and avoid duplicate variable conflicts.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "notebook_path": {"type": "string", "description": "Path to the Marimo .py notebook file."}
+            },
+            "required": ["notebook_path"]
+        }
+    },
+    {
+        "name": "marimo_get_runtime_data",
+        "description": "Query a running Marimo server for live cell statuses, variable state, and stdout. Requires Marimo to be running with: marimo edit notebook.py",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "marimo_server_url": {"type": "string", "description": "URL of the Marimo server. Default: http://localhost:2718"}
+            }
+        }
+    },
+    {
+        "name": "marimo_update_cell",
+        "description": "Replace the body of a named Marimo cell with new code. The cell name comes from marimo_get_cell_map. If Marimo is running with --watch, changes are reflected live in the browser. CRITICAL: Never define a variable in this cell that is already defined globally in another cell.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "notebook_path": {"type": "string", "description": "Path to the Marimo .py notebook."},
+                "cell_name": {"type": "string", "description": "The Python function name of the cell to update (from marimo_get_cell_map)."},
+                "new_code": {"type": "string", "description": "The new Python code for the cell body."}
+            },
+            "required": ["notebook_path", "cell_name", "new_code"]
+        }
+    },
+    {
+        "name": "marimo_add_cell",
+        "description": "Inject a new cell into a Marimo notebook. Inserts after a named cell or appends to the end. Use marimo_validate after adding to check for duplicate variable conflicts.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "notebook_path": {"type": "string", "description": "Path to the Marimo .py notebook."},
+                "code": {"type": "string", "description": "Python code for the new cell body."},
+                "after_cell": {"type": "string", "description": "Optional: Insert after this cell name. If omitted, appends before app.run()."},
+                "hide_code": {"type": "boolean", "description": "If true, hides the code in the notebook UI (good for UI-only cells)."}
+            },
+            "required": ["notebook_path", "code"]
+        }
+    },
+    {
+        "name": "marimo_check_notebook",
+        "description": "Validate a Marimo notebook for syntax and circular dependency errors (runs 'marimo check'). Returns any errors so you can self-correct. Run this after every set of edits.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "notebook_path": {"type": "string", "description": "Path to the Marimo .py notebook."}
+            },
+            "required": ["notebook_path"]
+        }
+    },
+    {
+        "name": "marimo_validate",
+        "description": "Check a Marimo notebook for duplicate global variable definitions across cells — the most common cause of DAG breakage. Always run after adding or modifying cells that define new variables.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "notebook_path": {"type": "string", "description": "Path to the Marimo .py notebook."}
+            },
+            "required": ["notebook_path"]
         }
     }
 ]
