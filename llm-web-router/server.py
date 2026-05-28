@@ -790,6 +790,166 @@ async def chat_completions(request: Request):
             if master_prompt and len(parts) > 0 and "SYSTEM CONFIGURATION" not in prompt:
                 prompt = f"[SYSTEM REINFORCEMENT]\n{master_prompt}\n[END]\n\n" + prompt
 
+        # ── Orchestrator loop (Marimo mode only) ─────────────────────────────
+        # For Marimo mode we run a tool-call loop inside the router:
+        #   1. Send prompt to DeepSeek via the browser.
+        #   2. Parse response for MODE: TOOL_CALLS or MODE: REPORT tag.
+        #   3. If TOOL_CALLS → execute tools, build a [TOOL RESULT] follow-up
+        #      and loop back to step 1.  Placeholder chunks are streamed live.
+        #   4. If REPORT (or no tag found after MAX_TOOL_ITERATIONS) → done.
+        # For zerobound / passthrough modes we keep the original single-shot path.
+        # ─────────────────────────────────────────────────────────────────────
+
+        MAX_TOOL_ITERATIONS = 10  # safety cap
+
+        if mode == "marimo" and stream:
+            # Import helpers once; errors fall through to passthrough.
+            _agent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../lean-agent"))
+            import sys as _sys
+            if _agent_path not in _sys.path:
+                _sys.path.insert(0, _agent_path)
+            try:
+                from agent_brain import _parse_tool_call as _ptc
+                from tool_registry import handle_tool_call as _htc
+                _orchestration_available = True
+            except Exception as _oe:
+                logger.warning("Orchestration helpers unavailable (%s); falling back to passthrough", _oe)
+                _orchestration_available = False
+
+            async def marimo_orchestrated_generate(
+                initial_prompt=prompt,
+                pg=page,
+                backend_cfg=cfg,
+                mdl=model_name,
+                imgs=pending_images,
+                orchestrate=_orchestration_available,
+            ):
+                chunk_id = f"chatcmpl-{abs(hash(initial_prompt))}"
+                ts = int(asyncio.get_event_loop().time())
+
+                # ── SSE helpers ──────────────────────────────────────────────
+                def _sse(content: str, finish: str = None) -> str:
+                    payload = {
+                        "id": chunk_id, "object": "chat.completion.chunk",
+                        "created": ts, "model": mdl,
+                        "choices": [{"index": 0,
+                                     "delta": {"content": content} if content else {},
+                                     "finish_reason": finish}],
+                    }
+                    return "data: " + json.dumps(payload) + "\n\n"
+
+                def _placeholder(text: str) -> str:
+                    """Emit a dim italic status line visible in Marimo."""
+                    return _sse(f"\n\n*{text}*\n\n")
+
+                # Role header
+                yield "data: " + json.dumps({
+                    "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": mdl,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+                }) + "\n\n"
+
+                current_prompt = initial_prompt
+                iteration = 0
+                final_text = ""
+
+                while iteration < MAX_TOOL_ITERATIONS:
+                    iteration += 1
+                    logger.info("[Orchestrator] Iteration %d – sending prompt to DeepSeek", iteration)
+
+                    try:
+                        raw = await get_response(pg, backend_cfg, current_prompt, None,
+                                                 image_urls=imgs if iteration == 1 else None)
+                    except RuntimeError as e:
+                        yield _sse(f"\n\n[Router Error] {e}\n\n", "stop")
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    # ── Parse mode tag ────────────────────────────────────────
+                    first_line = raw.split("\n", 1)[0].strip().upper()
+                    rest = raw.split("\n", 1)[1].strip() if "\n" in raw else raw
+
+                    # Tolerate responses where the LLM forgot the tag (treat as REPORT)
+                    is_tool_call_mode = "MODE: TOOL_CALLS" in first_line or "MODE:TOOL_CALLS" in first_line
+                    is_report_mode = "MODE: REPORT" in first_line or "MODE:REPORT" in first_line
+
+                    if not orchestrate:
+                        # Orchestration unavailable: stream raw text and stop
+                        final_text = raw
+                        break
+
+                    if is_tool_call_mode:
+                        # ── Execute tools ─────────────────────────────────────
+                        body = rest if rest else raw
+                        tool_calls = _ptc(body)
+
+                        if not tool_calls:
+                            # Model said TOOL_CALLS but we couldn't parse any — treat as REPORT
+                            final_text = body
+                            break
+
+                        tool_results_parts = []
+                        for tc in tool_calls:
+                            tool_name = tc.get("tool", "unknown")
+                            tool_args = tc.get("args", {})
+                            logger.info("[Orchestrator] Executing tool: %s(%s)", tool_name, tool_args)
+
+                            # Stream placeholder to Marimo so user sees progress
+                            yield _placeholder(f"⚙️ Executing tool: `{tool_name}`…")
+                            await asyncio.sleep(0)  # flush
+
+                            try:
+                                result = await _htc(tool_name, tool_args)
+                                result_str = json.dumps(result, default=str) if not isinstance(result, str) else result
+                            except Exception as te:
+                                result_str = f"ERROR: {te}"
+                                logger.warning("[Orchestrator] Tool %s failed: %s", tool_name, te)
+
+                            yield _placeholder(f"✅ `{tool_name}` done — {len(result_str)} chars returned.")
+                            await asyncio.sleep(0)
+
+                            tool_results_parts.append(
+                                f"[TOOL RESULT for {tool_name}]:\n{result_str}"
+                            )
+
+                        # Build next prompt (tool results only — DeepSeek already has history on the page)
+                        current_prompt = "\n\n".join(tool_results_parts) + "\n\nBased on these results, continue. Remember to begin with MODE: TOOL_CALLS or MODE: REPORT."
+                        imgs = None  # don't re-send images on follow-up turns
+
+                    elif is_report_mode:
+                        # ── Final answer ──────────────────────────────────────
+                        final_text = rest if rest else raw
+                        break
+
+                    else:
+                        # No recognized tag — treat entire response as final report
+                        logger.warning("[Orchestrator] No MODE tag found in iteration %d; treating as REPORT", iteration)
+                        final_text = raw
+                        break
+
+                else:
+                    # Exceeded max iterations — return whatever we have
+                    logger.warning("[Orchestrator] Hit max iterations (%d); returning last response", MAX_TOOL_ITERATIONS)
+                    final_text = raw if 'raw' in dir() else "(max iterations exceeded)"
+
+                # ── Stream final text to Marimo ───────────────────────────────
+                if final_text:
+                    # Drop any leftover MODE: REPORT / MODE: TOOL_CALLS prefix artefacts
+                    cleaned = re.sub(r'^MODE:\s*(REPORT|TOOL_CALLS)\s*\n?', '', final_text, flags=re.IGNORECASE).strip()
+                    tokens = re.split(r"(\s+)", cleaned)
+                    for token in tokens:
+                        if token:
+                            yield _sse(token)
+
+                yield _sse("", "stop")
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                marimo_orchestrated_generate(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # ── Non-orchestrated path (zerobound / passthrough / non-streaming) ──
         try:
             response_text = await get_response(page, cfg, prompt, request, image_urls=pending_images if pending_images else None)
         except RuntimeError as e:
@@ -812,19 +972,14 @@ async def chat_completions(request: Request):
             }
 
     if stream:
-        # Marimo (and other OpenAI-compatible clients) use stream=True.
-        # Since the browser response arrives all at once, we simulate streaming
-        # by emitting one SSE chunk per token. json.dumps ensures any quotes or
-        # newlines in the response text never corrupt the SSE JSON.
+        # Standard streaming for zerobound / passthrough modes
         async def generate(text=response_text, mdl=model_name):
             chunk_id = f"chatcmpl-{abs(hash(text))}"
             ts = int(asyncio.get_event_loop().time())
-            # Role header chunk (empty content, sets role)
             yield "data: " + json.dumps({
                 "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": mdl,
                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
             }) + "\n\n"
-            # Emit one chunk per token (words + whitespace separators)
             tokens = re.split(r"(\s+)", text)
             for token in tokens:
                 if not token:
@@ -833,7 +988,6 @@ async def chat_completions(request: Request):
                     "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": mdl,
                     "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}]
                 }) + "\n\n"
-            # Final stop chunk
             yield "data: " + json.dumps({
                 "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": mdl,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
@@ -858,6 +1012,7 @@ async def chat_completions(request: Request):
             "finish_reason": "stop"
         }]
     }
+
 
 
 @app.get("/v1/models")
