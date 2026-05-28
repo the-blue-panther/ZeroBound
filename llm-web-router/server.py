@@ -495,7 +495,7 @@ async def get_response(page: Page, cfg: Dict, prompt: str, request: Request, ima
 
     while True:
         await asyncio.sleep(0.5)
-        if await request.is_disconnected():
+        if request is not None and await request.is_disconnected():
             logger.warning("Client disconnected; aborting wait.")
             return "Disconnected"
 
