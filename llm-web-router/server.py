@@ -1052,27 +1052,31 @@ async def get_response(page: Page, cfg: Dict, prompt: str, request: Request, ima
         if stable_since >= target_stability:
             # Check for a "Continue" button and click it if present
             try:
-                continue_clicked = await page.evaluate("""
+                continue_box = await page.evaluate("""
                     () => {
                         const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
-                        for (const b of btns) {
+                        // Reverse array to find the LAST (most recent) continue button
+                        for (let i = btns.length - 1; i >= 0; i--) {
+                            const b = btns[i];
                             if (b.offsetWidth > 0 && b.offsetHeight > 0 && window.getComputedStyle(b).display !== 'none') {
                                 const txt = (b.innerText || '').trim().toLowerCase();
                                 if (txt === 'continue') {
-                                    b.click();
-                                    return true;
+                                    const r = b.getBoundingClientRect();
+                                    return {x: r.x + r.width/2, y: r.y + r.height/2};
                                 }
                             }
                         }
-                        return false;
+                        return null;
                     }
                 """)
-                if continue_clicked:
-                    logger.info("Clicked 'Continue' button to resume generation")
+                if continue_box:
+                    logger.info("Clicked 'Continue' button to resume generation (via mouse)")
+                    await page.mouse.click(continue_box['x'], continue_box['y'])
                     stable_since = 0.0
                     await asyncio.sleep(1)  # Give it a moment to resume
                     continue
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Error clicking continue button: {e}")
                 pass
                 
             break
