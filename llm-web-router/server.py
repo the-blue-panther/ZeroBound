@@ -519,6 +519,26 @@ async def get_markdown_via_copy_button(page: Page) -> Optional[str]:
         await page.evaluate("window.__zb_prev_button = null;")
 
         for attempt in range(10):
+            # Scroll the last message action bar into view before every scan attempt.
+            # Long responses push the action bar below the fold; this keeps it measurable.
+            try:
+                await page.evaluate("""
+                    () => {
+                        // Find last action bar row (_965abe9 class pattern from diagnostics)
+                        const bars = document.querySelectorAll('[class*="_965abe9"], [class*="_54866f7"]');
+                        if (bars.length > 0) {
+                            const last = bars[bars.length - 1];
+                            last.scrollIntoView({ block: 'center', behavior: 'instant' });
+                        } else {
+                            // Fallback: scroll to bottom
+                            window.scrollTo(0, document.body.scrollHeight);
+                        }
+                    }
+                """)
+                await page.wait_for_timeout(150)
+            except Exception:
+                pass
+
             # Find button using 4-tier selection strategy (most stable → most fragile)
             # IMPORTANT: We search fresh each attempt - button might become enabled on later attempts
             btn_handle = await page.evaluate_handle("""
@@ -610,11 +630,13 @@ async def get_markdown_via_copy_button(page: Page) -> Optional[str]:
                             'button, div[role="button"], [role="button"]'
                         )).filter(el => {
                             const r = el.getBoundingClientRect();
-                            // CRITICAL: Only consider ENABLED buttons
+                     // CRITICAL: Only consider ENABLED buttons
                             if (!isVisible(el) || !isEnabled(el)) return false;
                             if (!el.querySelector('svg')) return false;
                             if (r.top < window.innerHeight * 0.1) return false;
-                            if (r.top > window.innerHeight * 0.95) return false;
+                            // Exclude buttons with visible label text (code block Copy/Download)
+                            const txt = (el.innerText || '').toLowerCase().trim();
+                            if (txt === 'copy' || txt === 'download' || txt === 'run' || txt === 'insert') return false;
                             const cls = el.className.toLowerCase();
                             const aria = (el.getAttribute('aria-label') || '').toLowerCase();
                             if (cls.includes('menu') || cls.includes('nav') || aria.includes('menu')) return false;
@@ -640,7 +662,7 @@ async def get_markdown_via_copy_button(page: Page) -> Optional[str]:
                             positions: r.items.map(b => Math.round(b.getBoundingClientRect().left))
                         }));
 
-                        // Process rows: filter out input bar, run passes across valid rows
+                        // Filter out input bar (DeepThink/Search) AND code-block toolbars (Copy/Download text)
                         const isInputBarRow = row => {
                             return row.items.some(btn => {
                                 const text = (btn.innerText || '').toLowerCase();
@@ -648,7 +670,13 @@ async def get_markdown_via_copy_button(page: Page) -> Optional[str]:
                                 return text.includes('deepthink') || text.includes('search') || aria.includes('deepthink');
                             });
                         };
-                        const validRows = rows.filter(r => !isInputBarRow(r) && r.items.length >= 2);
+                        const isCodeBlockToolbar = row => {
+                            return row.items.some(btn => {
+                                const text = (btn.innerText || '').toLowerCase().trim();
+                                return text === 'copy' || text === 'download' || text === 'run' || text === 'insert';
+                            });
+                        };
+                        const validRows = rows.filter(r => !isInputBarRow(r) && !isCodeBlockToolbar(r) && r.items.length >= 2);
                         
                         for (const row of validRows) {
                             row.items.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
@@ -693,6 +721,8 @@ async def get_markdown_via_copy_button(page: Page) -> Optional[str]:
                                 if (!isVisible(el) || !isEnabled(el)) return false;
                                 const r = el.getBoundingClientRect();
                                 if (r.top < window.innerHeight * 0.15) return false;
+                                const txt = (el.innerText || '').toLowerCase().trim();
+                                if (txt === 'copy' || txt === 'download' || txt === 'run' || txt === 'insert') return false;
                                 if (!hasCopyIcon(el)) return false;
                                 return true;
                             });
@@ -706,7 +736,13 @@ async def get_markdown_via_copy_button(page: Page) -> Optional[str]:
                     // ─── TIER 4: Last resort - any enabled icon button ───
                     if (!selected_btn) {
                         const allEnabled = Array.from(document.querySelectorAll('button, [role="button"]'))
-                            .filter(el => isVisible(el) && isEnabled(el) && el.querySelector('svg'))
+                            .filter(el => {
+                                if (!isVisible(el) || !isEnabled(el)) return false;
+                                if (!el.querySelector('svg')) return false;
+                                const txt = (el.innerText || '').toLowerCase().trim();
+                                if (txt === 'copy' || txt === 'download' || txt === 'run' || txt === 'insert') return false;
+                                return true;
+                            })
                             .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
 
                         if (allEnabled.length > 0) {
@@ -1014,6 +1050,31 @@ async def get_response(page: Page, cfg: Dict, prompt: str, request: Request, ima
         last_text = current
 
         if stable_since >= target_stability:
+            # Check for a "Continue" button and click it if present
+            try:
+                continue_clicked = await page.evaluate("""
+                    () => {
+                        const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+                        for (const b of btns) {
+                            if (b.offsetWidth > 0 && b.offsetHeight > 0 && window.getComputedStyle(b).display !== 'none') {
+                                const txt = (b.innerText || '').trim().toLowerCase();
+                                if (txt === 'continue') {
+                                    b.click();
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                if continue_clicked:
+                    logger.info("Clicked 'Continue' button to resume generation")
+                    stable_since = 0.0
+                    await asyncio.sleep(1)  # Give it a moment to resume
+                    continue
+            except Exception:
+                pass
+                
             break
         if elapsed > MAX_WAIT:
             break
