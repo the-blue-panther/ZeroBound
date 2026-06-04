@@ -666,8 +666,11 @@ async def get_markdown_via_copy_button(page: Page) -> Optional[str]:
                         const isInputBarRow = row => {
                             return row.items.some(btn => {
                                 const text = (btn.innerText || '').toLowerCase();
-                                const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-                                return text.includes('deepthink') || text.includes('search') || aria.includes('deepthink');
+                                const aria = (btn.getAttribute('aria-label') || btn.getAttribute('title') || '').toLowerCase();
+                                return text.includes('deepthink') || text.includes('search') || 
+                                       aria.includes('deepthink') || aria.includes('search') ||
+                                       aria.includes('upload') || aria.includes('attach') || 
+                                       aria.includes('send') || aria.includes('voice');
                             });
                         };
                         const isCodeBlockToolbar = row => {
@@ -723,6 +726,8 @@ async def get_markdown_via_copy_button(page: Page) -> Optional[str]:
                                 if (r.top < window.innerHeight * 0.15) return false;
                                 const txt = (el.innerText || '').toLowerCase().trim();
                                 if (txt === 'copy' || txt === 'download' || txt === 'run' || txt === 'insert') return false;
+                                const aria = (el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+                                if (aria.includes('upload') || aria.includes('attach') || aria.includes('send') || aria.includes('voice') || aria.includes('deepthink') || aria.includes('search')) return false;
                                 if (!hasCopyIcon(el)) return false;
                                 return true;
                             });
@@ -741,6 +746,8 @@ async def get_markdown_via_copy_button(page: Page) -> Optional[str]:
                                 if (!el.querySelector('svg')) return false;
                                 const txt = (el.innerText || '').toLowerCase().trim();
                                 if (txt === 'copy' || txt === 'download' || txt === 'run' || txt === 'insert') return false;
+                                const aria = (el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+                                if (aria.includes('upload') || aria.includes('attach') || aria.includes('send') || aria.includes('voice') || aria.includes('deepthink') || aria.includes('search')) return false;
                                 return true;
                             })
                             .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
